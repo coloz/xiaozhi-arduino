@@ -1,0 +1,121 @@
+#pragma once
+
+#include <cstddef>
+#include <cstdint>
+#include <string>
+
+#include "Audio.h"
+#include "Clock.h"
+#include "McpServer.h"
+#include "Protocol.h"
+#include "StateMachine.h"
+#include "Transport.h"
+#include "Types.h"
+
+namespace xiaozhi {
+
+class Client {
+public:
+    explicit Client(Transport& transport, Clock* clock = nullptr);
+    ~Client();
+
+    Client(const Client&) = delete;
+    Client& operator=(const Client&) = delete;
+
+    bool begin(const ClientConfig& config, Callbacks callbacks = {});
+    void end();
+    void loop();
+
+    bool startListening(ListeningMode mode = ListeningMode::ManualStop);
+    bool stopListening();
+    bool toggleChat();
+    bool abortSpeaking(AbortReason reason = AbortReason::None);
+    bool wakeWordDetected(const std::string& wake_word);
+    bool closeSession();
+
+    bool sendAudio(const uint8_t* opus, size_t size, uint32_t timestamp = 0);
+    bool sendMcp(const std::string& json_rpc_payload);
+
+    State state() const { return state_machine_.state(); }
+    const char* stateName() const { return xiaozhi::stateName(state()); }
+    bool ready() const { return begun_; }
+    bool sessionReady() const { return session_ready_; }
+    const std::string& sessionId() const { return session_id_; }
+    const AudioFormat& serverAudioFormat() const { return server_audio_format_; }
+    ListeningMode listeningMode() const { return listening_mode_; }
+    const ClientConfig& config() const { return config_; }
+
+    McpServer& mcp() { return mcp_server_; }
+    const McpServer& mcp() const { return mcp_server_; }
+    bool attachAudioPort(EncodedAudioPort* audio_port);
+
+private:
+    class DispatchScope {
+    public:
+        explicit DispatchScope(Client& client) : client_(client) {
+            client_.beginDispatch();
+        }
+        ~DispatchScope() { client_.endDispatch(); }
+
+        DispatchScope(const DispatchScope&) = delete;
+        DispatchScope& operator=(const DispatchScope&) = delete;
+
+    private:
+        Client& client_;
+    };
+
+    Transport& transport_;
+    SteadyClock default_clock_;
+    Clock& clock_;
+    StateMachine state_machine_;
+    McpServer mcp_server_;
+    ClientConfig config_;
+    Callbacks callbacks_;
+
+    bool begun_ = false;
+    bool begin_in_progress_ = false;
+    // User callbacks may request end(), but teardown is committed only after the
+    // outermost Client dispatch completes and no callback frame remains active.
+    bool end_requested_ = false;
+    bool ending_ = false;
+    size_t dispatch_depth_ = 0;
+    size_t user_callback_depth_ = 0;
+    bool reporting_error_ = false;
+    bool closing_ = false;
+    bool awaiting_hello_ = false;
+    bool session_ready_ = false;
+    bool capture_enabled_ = false;
+    uint64_t handshake_started_ms_ = 0;
+    uint64_t last_incoming_ms_ = 0;
+    ListeningMode listening_mode_ = ListeningMode::AutoStop;
+    AudioFormat server_audio_format_{24000, 60, 1};
+    std::string session_id_;
+    std::string pending_wake_word_;
+    EncodedAudioPort* audio_port_ = nullptr;
+    bool audio_port_started_ = false;
+    bool pending_listening_start_ = false;
+
+    void installTransportCallbacks();
+    void onTransportOpen();
+    void onTransportText(const uint8_t* data, size_t size);
+    void onTransportBinary(const uint8_t* data, size_t size);
+    void onTransportClose();
+    void onTransportError(const std::string& message);
+
+    bool connectSession();
+    bool enterListening();
+    bool enterListeningOrClose();
+    bool sendText(const std::string& text);
+    void setCaptureEnabled(bool enabled);
+    void beginDispatch();
+    void endDispatch();
+    void beginUserCallback();
+    void endUserCallback();
+    void finishDeferredEnd();
+    void clearSession();
+    void handleStateChange(State old_state, State new_state);
+    void emitEvent(Event event);
+    void reportError(ErrorCode code, const std::string& message);
+};
+
+}  // namespace xiaozhi

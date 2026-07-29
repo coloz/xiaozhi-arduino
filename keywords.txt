@@ -1,0 +1,10 @@
+Xiaozhi	KEYWORD1
+Client	KEYWORD1
+ArduinoWebSocketTransport	KEYWORD1
+McpServer	KEYWORD1
+Protocol	KEYWORD1
+startListening	KEYWORD2
+stopListening	KEYWORD2
+wakeWordDetected	KEYWORD2
+addTool	KEYWORD2
+
