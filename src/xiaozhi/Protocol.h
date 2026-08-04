@@ -14,6 +14,15 @@ struct ServerHello {
     AudioFormat audio;
 };
 
+// Non-owning result used to validate and gate a binary frame before allocating
+// its Opus payload. The view is valid only while the input bytes remain alive.
+struct AudioFrameView {
+    AudioFormat format;
+    uint32_t timestamp = 0;
+    const uint8_t* opus = nullptr;
+    size_t opus_size = 0;
+};
+
 class Protocol {
 public:
     static bool validateConfig(const ClientConfig& config, std::string& error);
@@ -36,6 +45,9 @@ public:
     static bool encodeAudio(uint8_t version, const uint8_t* opus, size_t opus_size,
                             uint32_t timestamp, size_t max_payload,
                             std::vector<uint8_t>& output, std::string& error);
+    static bool parseAudioView(uint8_t version, const uint8_t* data, size_t size,
+                               const AudioFormat& format, size_t max_payload,
+                               AudioFrameView& output, std::string& error);
     static bool decodeAudio(uint8_t version, const uint8_t* data, size_t size,
                             const AudioFormat& format, size_t max_payload,
                             AudioFrame& output, std::string& error);

@@ -9,6 +9,7 @@
 #include "xiaozhi/Audio.h"
 #include "xiaozhi/Client.h"
 #include "xiaozhi/Clock.h"
+#include "xiaozhi/Emotion.h"
 #include "xiaozhi/Esp32Identity.h"
 #include "xiaozhi/McpServer.h"
 #include "xiaozhi/Protocol.h"
@@ -16,4 +17,3 @@
 #include "xiaozhi/StateMachine.h"
 #include "xiaozhi/Transport.h"
 #include "xiaozhi/Types.h"
-

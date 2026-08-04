@@ -7,24 +7,33 @@
  */
 
 #include <Arduino.h>
+
+#include "BoardConfig.h"
+#include "BoardAudioConfig.h"
+
 #include <TFT_eSPI.h>  // Uses the sketch-local User_Setup.h for this board.
 #include <WiFi.h>
-#include <Wire.h>
 #include <ArduinoWebsockets.h>  // Makes the optional transport dependency explicit.
+#if XIAOZHI_AUDIO_ENABLE_WAKE_ESP_SR
 #include <ESP_SR.h>             // WakeNet and its model-image build hook.
+#endif
+#if XIAOZHI_AUDIO_ENABLE_CODEC_ES8311
+#include <Wire.h>
 #include <EspressifEs8311.h>    // Audio dependencies used by the implementation.
+#endif
 #include <EspressifOpus.h>
 #include <Xiaozhi.h>
 
-#include "BoardConfig.h"
-#include "I2sOpusAudioPort.h"
+#if __has_include("Secrets.h")
+#include "Secrets.h"
+#endif
 // Keep the optional audio implementation in this sketch translation unit.
 // The .impl.h suffix prevents Arduino builders from compiling it a second time.
 #include "I2sOpusAudioPort.impl.h"
 
-// The Opus implementation needs more stack than Arduino's default 8 KiB loop
-// task, especially on the first encoded frame.
-SET_LOOP_TASK_STACK_SIZE(48 * 1024);
+// Protocol/UI callbacks need more than Arduino's default 8 KiB. Opus now runs
+// on its dedicated codec task, so the loop no longer needs a 48 KiB stack.
+SET_LOOP_TASK_STACK_SIZE(16 * 1024);
 
 // Optional dependencies for this example only:
 //   TFT_eSPI >= 2.5 and ArduinoWebsockets >= 0.5.4
@@ -33,38 +42,19 @@ SET_LOOP_TASK_STACK_SIZE(48 * 1024);
 TFT_eSPI tft;
 xiaozhi::ArduinoWebSocketTransport transport;
 
-I2sOpusAudioPort::Config makeAudioConfig() {
-  I2sOpusAudioPort::Config config;
-  config.wire = &Wire;
-  config.i2cSda = BOARD_AUDIO_I2C_SDA;
-  config.i2cScl = BOARD_AUDIO_I2C_SCL;
-  config.i2cFrequency = BOARD_AUDIO_I2C_FREQUENCY;
-  config.codecAddress = BOARD_AUDIO_CODEC_ADDRESS;
-  config.i2sPort = BOARD_AUDIO_I2S_PORT;
-  config.mclk = BOARD_AUDIO_MCLK;
-  config.bclk = BOARD_AUDIO_BCLK;
-  config.ws = BOARD_AUDIO_WS;
-  config.dataOut = BOARD_AUDIO_DATA_OUT;
-  config.dataIn = BOARD_AUDIO_DATA_IN;
-  config.invertMclk = BOARD_AUDIO_MCLK_INVERTED;
-  config.invertBclk = BOARD_AUDIO_BCLK_INVERTED;
-  config.invertWs = BOARD_AUDIO_WS_INVERTED;
-  config.hardwareSampleRate = BOARD_AUDIO_HARDWARE_SAMPLE_RATE;
-  config.mclkMultiple = BOARD_AUDIO_MCLK_MULTIPLE;
-  config.paSupplyVoltage = BOARD_AUDIO_PA_SUPPLY_VOLTAGE;
-  config.codecDacVoltage = BOARD_AUDIO_CODEC_DAC_VOLTAGE;
-  config.paGainDb = BOARD_AUDIO_PA_GAIN_DB;
-  config.microphoneGainDb = BOARD_AUDIO_MIC_GAIN_DB;
-  config.outputVolumeDb = BOARD_AUDIO_OUTPUT_VOLUME_DB;
-  return config;
-}
-
-const I2sOpusAudioPort::Config audioConfig = makeAudioConfig();
+const I2sOpusAudioPort::Config audioConfig =
+    xiaozhi_audio_board::makeConfig();
 I2sOpusAudioPort audioPort(audioConfig);
 
 namespace {
-constexpr char kWifiSsid[] = "YOUR_WIFI_SSID";
-constexpr char kWifiPassword[] = "YOUR_WIFI_PASSWORD";
+#ifndef XIAOZHI_WIFI_SSID
+#define XIAOZHI_WIFI_SSID "YOUR_WIFI_SSID"
+#endif
+#ifndef XIAOZHI_WIFI_PASSWORD
+#define XIAOZHI_WIFI_PASSWORD "YOUR_WIFI_PASSWORD"
+#endif
+constexpr char kWifiSsid[] = XIAOZHI_WIFI_SSID;
+constexpr char kWifiPassword[] = XIAOZHI_WIFI_PASSWORD;
 
 // The library uses Xiaozhi's official provisioning service by default. This
 // legacy fully-custom block is intentionally disabled; users who need a custom
@@ -99,6 +89,7 @@ extern const uint8_t x509CrtBundleEnd[] asm("_binary_x509_crt_bundle_end");
 #endif
 
 std::string statusLine = "starting";
+std::string emotionLine = "neutral";
 std::string roleLine = "system";
 std::string messageLine = "Xiaozhi Arduino";
 bool displayDirty = true;
@@ -110,15 +101,6 @@ uint32_t chatButtonChangedMs = 0;
 
 constexpr uint32_t kChatButtonDebounceMs = 40;
 constexpr uint32_t kSpeakingSilenceTimeoutMs = 12000;
-
-bool detectConfiguredCodec() {
-  if (!Wire.begin(audioConfig.i2cSda, audioConfig.i2cScl,
-                  audioConfig.i2cFrequency)) {
-    return false;
-  }
-  Wire.beginTransmission(audioConfig.codecAddress);
-  return Wire.endTransmission() == 0;
-}
 
 bool hasPlaceholderNetworkConfig() {
   return strcmp(kWifiSsid, "YOUR_WIFI_SSID") == 0 ||
@@ -159,8 +141,9 @@ void connectConfiguredWifi() {
     messageLine = "WiFi unavailable; retrying";
     displayDirty = true;
     Serial.printf("[wifi] connection failed, status=%d\n", WiFi.status());
-    logConfiguredNetworkScan();
     WiFi.disconnect(false, false);
+    delay(250);
+    logConfiguredNetworkScan();
     delay(5000);
   }
 }
@@ -253,11 +236,14 @@ void redraw() {
   tft.setTextColor(TFT_YELLOW, TFT_BLACK);
   tft.setCursor(8, 42);
   tft.printf("state: %s", statusLine.c_str());
-  tft.setTextColor(TFT_GREEN, TFT_BLACK);
+  tft.setTextColor(TFT_MAGENTA, TFT_BLACK);
   tft.setCursor(8, 62);
+  tft.printf("emotion: %s", emotionLine.c_str());
+  tft.setTextColor(TFT_GREEN, TFT_BLACK);
+  tft.setCursor(8, 82);
   tft.printf("%s:", roleLine.c_str());
   tft.setTextColor(TFT_WHITE, TFT_BLACK);
-  tft.setCursor(8, 80);
+  tft.setCursor(8, 100);
   tft.setTextWrap(true, false);
   tft.print(messageLine.c_str());
 }
@@ -273,7 +259,9 @@ void onEvent(const xiaozhi::Event& event) {
       Serial.printf("[xiaozhi] TTS: %s\n", event.text.c_str());
       break;
     case xiaozhi::EventType::Emotion:
-      setMessage("emotion", event.emotion);
+      emotionLine.assign(event.emotion.data(),
+                         std::min<size_t>(event.emotion.size(), 64));
+      Serial.printf("[xiaozhi] emotion: %s\n", emotionLine.c_str());
       break;
     case xiaozhi::EventType::Alert:
       setMessage(event.status, event.text);
@@ -351,16 +339,35 @@ void setup() {
   redraw();
   Serial.printf("[display] initialized: %dx%d\n", tft.width(), tft.height());
 
-  Serial.printf("[audio] MCLK=%d BCLK=%d WS=%d OUT=%d IN=%d SDA=%d SCL=%d\n",
-                audioConfig.mclk, audioConfig.bclk, audioConfig.ws,
-                audioConfig.dataOut, audioConfig.dataIn, audioConfig.i2cSda,
-                audioConfig.i2cScl);
-  if (detectConfiguredCodec()) {
-    Serial.printf("[audio] codec detected at I2C address 0x%02X\n",
-                  audioConfig.codecAddress);
+  const auto& audioOutput = audioConfig.hardware.output;
+  Serial.printf("[audio] profile=%s OUT port=%d MCLK=%d BCLK=%d WS=%d DATA=%d\n",
+                I2sOpusAudioPort::Config::compiledProfileName(),
+                audioOutput.port, audioOutput.mclk, audioOutput.bclk,
+                audioOutput.ws, audioOutput.data);
+#if XIAOZHI_AUDIO_ENABLE_INPUT_I2S_PDM
+  const auto& audioInput = audioConfig.hardware.pdmInput;
+  Serial.printf("[audio] IN PDM port=%d CLK=%d DATA=%d\n",
+                audioInput.port, audioInput.clock, audioInput.data);
+#else
+  const auto& audioInput = audioConfig.hardware.input;
+  Serial.printf("[audio] IN I2S port=%d MCLK=%d BCLK=%d WS=%d DATA=%d\n",
+                audioInput.port, audioInput.mclk, audioInput.bclk,
+                audioInput.ws, audioInput.data);
+#endif
+  if (xiaozhi_audio_board::probe(audioConfig)) {
+#if XIAOZHI_AUDIO_ENABLE_CODEC_ES8311
+    Serial.printf("[audio] ES8311 detected at I2C address 0x%02X\n",
+                  audioConfig.hardware.es8311.address);
+#else
+    Serial.println("[audio] direct audio pins configured; runtime probe unavailable");
+#endif
   } else {
-    Serial.printf("[audio] codec not detected at I2C address 0x%02X\n",
-                  audioConfig.codecAddress);
+#if XIAOZHI_AUDIO_ENABLE_CODEC_ES8311
+    Serial.printf("[audio] ES8311 not detected at I2C address 0x%02X\n",
+                  audioConfig.hardware.es8311.address);
+#else
+    Serial.println("[audio] selected audio hardware probe failed");
+#endif
   }
 
   if (hasPlaceholderNetworkConfig()) {
@@ -437,6 +444,13 @@ void setup() {
     statusLine = xiaozhi::stateName(next);
     displayDirty = true;
     Serial.printf("[xiaozhi] state=%s\n", xiaozhi::stateName(next));
+    const bool lowLatencySession = client.sessionReady() ||
+                                   next == xiaozhi::State::Connecting ||
+                                   next == xiaozhi::State::Listening ||
+                                   next == xiaozhi::State::Speaking;
+    // Modem sleep is useful after the audio channel closes but can add
+    // DTIM-sized jitter even in ManualStop's idle-yet-connected state.
+    WiFi.setSleep(!lowLatencySession);
     audioPort.setWakeDetectionEnabled(next == xiaozhi::State::Idle);
     if (next == xiaozhi::State::Listening) {
       lastSpeakingAudioMs = 0;

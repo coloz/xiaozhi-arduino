@@ -135,6 +135,10 @@ bool Protocol::validateConfig(const ClientConfig& config, std::string& error) {
         error = "protocol_version must be 1, 2, or 3";
         return false;
     }
+    if (config.enable_server_aec && config.protocol_version != 2) {
+        error = "server AEC requires WebSocket protocol version 2 timestamps";
+        return false;
+    }
     if (!validSampleRate(config.input_audio.sample_rate) ||
         !validFrameDuration(config.input_audio.frame_duration_ms) ||
         config.input_audio.channels != 1) {
@@ -351,7 +355,9 @@ bool Protocol::encodeAudio(uint8_t version, const uint8_t* opus, size_t opus_siz
     if (version == 1) {
         output.assign(opus, opus + opus_size);
     } else if (version == 2) {
-        output.assign(kProtocol2HeaderSize + opus_size, 0);
+        // Every byte is overwritten below. resize() reuses the Client-owned
+        // capacity without first clearing the Opus payload on every frame.
+        output.resize(kProtocol2HeaderSize + opus_size);
         writeBe16(output.data(), 2);
         writeBe16(output.data() + 2, 0);
         writeBe32(output.data() + 4, 0);
@@ -359,7 +365,7 @@ bool Protocol::encodeAudio(uint8_t version, const uint8_t* opus, size_t opus_siz
         writeBe32(output.data() + 12, static_cast<uint32_t>(opus_size));
         std::memcpy(output.data() + kProtocol2HeaderSize, opus, opus_size);
     } else if (version == 3) {
-        output.assign(kProtocol3HeaderSize + opus_size, 0);
+        output.resize(kProtocol3HeaderSize + opus_size);
         output[0] = 0;
         output[1] = 0;
         writeBe16(output.data() + 2, static_cast<uint16_t>(opus_size));
@@ -373,9 +379,9 @@ bool Protocol::encodeAudio(uint8_t version, const uint8_t* opus, size_t opus_siz
     return true;
 }
 
-bool Protocol::decodeAudio(uint8_t version, const uint8_t* data, size_t size,
-                           const AudioFormat& format, size_t max_payload,
-                           AudioFrame& output, std::string& error) {
+bool Protocol::parseAudioView(uint8_t version, const uint8_t* data, size_t size,
+                              const AudioFormat& format, size_t max_payload,
+                              AudioFrameView& output, std::string& error) {
     if (data == nullptr || size == 0) {
         error = "empty audio frame";
         return false;
@@ -432,8 +438,22 @@ bool Protocol::decodeAudio(uint8_t version, const uint8_t* data, size_t size,
 
     output.format = format;
     output.timestamp = timestamp;
-    output.opus.assign(payload, payload + payload_size);
+    output.opus = payload;
+    output.opus_size = payload_size;
     error.clear();
+    return true;
+}
+
+bool Protocol::decodeAudio(uint8_t version, const uint8_t* data, size_t size,
+                           const AudioFormat& format, size_t max_payload,
+                           AudioFrame& output, std::string& error) {
+    AudioFrameView view;
+    if (!parseAudioView(version, data, size, format, max_payload, view, error)) {
+        return false;
+    }
+    output.format = view.format;
+    output.timestamp = view.timestamp;
+    output.opus.assign(view.opus, view.opus + view.opus_size);
     return true;
 }
 

@@ -531,7 +531,16 @@ bool McpServer::handle(const uint8_t* data, size_t size, std::string& response,
         return true;
     }
 
-    JsonObjectConst root = request.as<JsonObjectConst>();
+    return handle(request.as<JsonObjectConst>(), response, error);
+}
+
+bool McpServer::handle(JsonObjectConst root, std::string& response,
+                       std::string& error) const {
+    response.clear();
+    if (measureJson(root) > max_response_bytes_) {
+        error = "MCP request exceeds the configured size limit";
+        return false;
+    }
     std::string jsonrpc;
     std::string method;
     if (!copyJsonString(root["jsonrpc"], jsonrpc, 3) || jsonrpc != "2.0" ||

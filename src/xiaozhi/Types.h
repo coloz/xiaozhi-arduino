@@ -6,6 +6,8 @@
 #include <string>
 #include <vector>
 
+#include "Emotion.h"
+
 namespace xiaozhi {
 
 enum class State : uint8_t {
@@ -75,8 +77,11 @@ struct Event {
     EventType type = EventType::UnknownMessage;
     std::string text;
     std::string status;
+    // Raw protocol value retained for compatibility and custom server values.
     std::string emotion;
     std::string json;
+    // Kept after the original fields so existing aggregate initialization remains valid.
+    Emotion emotion_type = Emotion::Unknown;
 };
 
 struct ClientConfig {
@@ -93,6 +98,8 @@ struct ClientConfig {
     size_t max_json_bytes = 8192;
     size_t max_audio_payload_bytes = 4096;
     bool enable_mcp = true;
+    // Server AEC uses protocol-v2 timestamps. A compatible audio port should
+    // return the timestamp of a downlink frame after it reaches playback I/O.
     bool enable_server_aec = false;
     bool deliver_audio_outside_speaking = false;
 };

@@ -34,6 +34,9 @@ public:
 };
 
 // A complete optional audio extension exchanges encoded frames with Client.
+// Client and Transport are single-task APIs: worker tasks may fill private
+// queues, but Uplink must be invoked by loop() on the same task as Client::loop().
+// end() must stop workers and quiesce every pending Uplink before returning.
 class EncodedAudioPort {
 public:
     using Uplink = std::function<bool(const uint8_t* opus, size_t size, uint32_t timestamp)>;
@@ -44,9 +47,20 @@ public:
     virtual void loop() = 0;
     virtual void setCaptureEnabled(bool enabled) = 0;
     virtual void play(const AudioFrame& frame) = 0;
+    // Move-aware ports can override this overload to take ownership of the
+    // encoded payload without another allocation. Existing ports remain source
+    // compatible through the const-reference fallback.
+    virtual void play(AudioFrame&& frame) { play(frame); }
+    // Stop locally queued/in-flight playback after a user abort, disconnect, or
+    // new TTS generation. Implementations should be idempotent and non-blocking
+    // apart from the short synchronization needed to invalidate old work.
+    virtual void cancelPlayback() {}
     // Return false while decoded audio is still queued or playing. Auto/realtime listening
     // waits for this signal before reopening capture, which reduces tail echo.
     virtual bool playbackIdle() const { return true; }
+    // Best-effort observability for UI/diagnostics; zero is valid for ports that
+    // do not expose their queue depth.
+    virtual uint32_t queuedPlaybackMs() const { return 0; }
 };
 
 }  // namespace xiaozhi

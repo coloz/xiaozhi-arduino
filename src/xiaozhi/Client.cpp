@@ -2,12 +2,15 @@
 
 #include <ArduinoJson.h>
 
+#include <algorithm>
 #include <cstring>
 #include <utility>
 #include <vector>
 
 namespace xiaozhi {
 namespace {
+
+constexpr size_t kMaximumDeferredTextSends = 4;
 
 std::string jsonString(JsonVariantConst value) {
     std::string output;
@@ -56,6 +59,13 @@ bool Client::begin(const ClientConfig& config, Callbacks callbacks) {
     }
 
     config_ = config;
+    deferred_text_sends_.clear();
+    deferred_text_sends_.reserve(kMaximumDeferredTextSends);
+    deferred_text_bytes_ = 0;
+    audio_send_buffer_.clear();
+    if (config_.protocol_version != 1) {
+        audio_send_buffer_.reserve(config_.max_audio_payload_bytes + 16);
+    }
     callbacks_ = std::move(callbacks);
     // Reserve room for the outer {session_id,type,payload} envelope and escaping.
     mcp_server_.setMaxResponseBytes(config_.max_json_bytes - 384);
@@ -130,14 +140,15 @@ void Client::end() {
     setCaptureEnabled(false);
     if (audio_port_started_ && audio_port_ != nullptr) {
         audio_port_->setCaptureEnabled(false);
+        audio_port_->cancelPlayback();
         audio_port_->end();
         audio_port_started_ = false;
     }
-    closing_ = true;
-    if (transport_.connected()) {
-        transport_.close();
-    }
-    closing_ = false;
+    // close() is also the Transport's quiescence barrier. Call it even after
+    // connected() became false so a deferred terminal callback from the old
+    // connection cannot arrive after a later reconnect.
+    expected_close_ = true;
+    transport_.close();
     clearSession();
     const State current = state_machine_.state();
     if (current == State::Connecting || current == State::Listening ||
@@ -154,12 +165,24 @@ void Client::loop() {
     if (user_callback_depth_ != 0 || !begun_ || end_requested_) {
         return;
     }
-    transport_.loop();
+    // Give bounded uplink work the first timeslice. ArduinoWebsockets::poll()
+    // drains every currently available message and can otherwise delay a ready
+    // microphone packet during a downlink burst.
+    if (audio_port_started_ && audio_port_ != nullptr) {
+        audio_port_->loop();
+    }
     if (end_requested_) {
         return;
     }
-    if (audio_port_started_ && audio_port_ != nullptr) {
-        audio_port_->loop();
+    // Let callbacks update Client state synchronously, but defer protocol sends
+    // until loop() returns. The Transport never has to accept send() while its
+    // own connect/loop/send stack is active.
+    deferred_text_chain_count_ = 0;
+    ++transport_call_depth_;
+    transport_.loop();
+    --transport_call_depth_;
+    if (!drainDeferredTextSends()) {
+        return;
     }
     if (end_requested_) {
         return;
@@ -207,7 +230,23 @@ bool Client::startListening(ListeningMode mode) {
     listening_mode_ = mode;
     const State current = state_machine_.state();
     if (current == State::Speaking) {
+        const std::string active_session = session_id_;
         if (!abortSpeaking(AbortReason::None)) {
+            return false;
+        }
+        if (end_requested_ || !begun_ || !session_ready_ ||
+            session_id_ != active_session) {
+            return false;
+        }
+        const State state_after_abort = state_machine_.state();
+        if (state_after_abort == State::Listening ||
+            (state_after_abort == State::Speaking && !downlink_suppressed_ &&
+             pending_wake_word_.empty())) {
+            // A synchronous TTS stop/start callback already advanced the turn.
+            return true;
+        }
+        if (state_after_abort != State::Speaking &&
+            !(state_after_abort == State::Idle && transport_.connected())) {
             return false;
         }
         if (!state_machine_.transitionTo(State::Listening)) {
@@ -217,10 +256,12 @@ bool Client::startListening(ListeningMode mode) {
         if (end_requested_ || !begun_ || state_machine_.state() != State::Listening) {
             return false;
         }
-        return enterListeningOrClose();
+        setCaptureEnabled(false);
+        return enterListeningWhenPlaybackIdleOrClose();
     }
     if (current == State::Listening) {
-        return enterListeningOrClose();
+        setCaptureEnabled(false);
+        return enterListeningWhenPlaybackIdleOrClose();
     }
     if (current != State::Idle) {
         reportError(ErrorCode::InvalidState,
@@ -236,7 +277,7 @@ bool Client::startListening(ListeningMode mode) {
         if (end_requested_ || !begun_ || state_machine_.state() != State::Listening) {
             return false;
         }
-        return enterListeningOrClose();
+        return enterListeningWhenPlaybackIdleOrClose();
     }
 
     if (!state_machine_.transitionTo(State::Connecting)) {
@@ -279,7 +320,9 @@ bool Client::toggleChat() {
     }
     switch (state_machine_.state()) {
         case State::Idle:
-            return startListening(ListeningMode::AutoStop);
+            return startListening(config_.enable_server_aec
+                                      ? ListeningMode::Realtime
+                                      : ListeningMode::AutoStop);
         case State::Speaking:
             return abortSpeaking(AbortReason::None);
         case State::Listening:
@@ -303,6 +346,10 @@ bool Client::abortSpeaking(AbortReason reason) {
         reportError(ErrorCode::InvalidState, "abortSpeaking requires an active speaking session");
         return false;
     }
+    // Local playback must stop on user intent even if the network abort later
+    // fails. Waiting for the server leaves already-buffered speech audible.
+    downlink_suppressed_ = true;
+    cancelPlayback();
     std::string message;
     return Protocol::makeAbort(session_id_, reason, message) && sendText(message) &&
            !end_requested_;
@@ -324,24 +371,47 @@ bool Client::wakeWordDetected(const std::string& wake_word) {
     const State current = state_machine_.state();
     pending_wake_word_ = wake_word;
     if (current == State::Idle) {
-        return startListening(ListeningMode::AutoStop);
+        return startListening(config_.enable_server_aec
+                                  ? ListeningMode::Realtime
+                                  : ListeningMode::AutoStop);
     }
     if (current == State::Speaking) {
-        if (!abortSpeaking(AbortReason::WakeWordDetected) ||
+        const std::string active_session = session_id_;
+        if (!abortSpeaking(AbortReason::WakeWordDetected)) {
+            pending_wake_word_.clear();
+            return false;
+        }
+        if (end_requested_ || !begun_ || !session_ready_ ||
+            session_id_ != active_session) {
+            pending_wake_word_.clear();
+            return false;
+        }
+        const State state_after_abort = state_machine_.state();
+        if (state_after_abort == State::Listening ||
+            (state_after_abort == State::Speaking && !downlink_suppressed_ &&
+             pending_wake_word_.empty())) {
+            return true;
+        }
+        if ((state_after_abort != State::Speaking &&
+             !(state_after_abort == State::Idle && transport_.connected())) ||
             !state_machine_.transitionTo(State::Listening)) {
             pending_wake_word_.clear();
             return false;
         }
-        return enterListeningOrClose();
+        setCaptureEnabled(false);
+        return enterListeningWhenPlaybackIdleOrClose();
     }
     if (current == State::Listening) {
+        downlink_suppressed_ = true;
+        cancelPlayback();
+        setCaptureEnabled(false);
         std::string abort;
         if (!Protocol::makeAbort(session_id_, AbortReason::WakeWordDetected, abort) ||
             !sendText(abort)) {
             pending_wake_word_.clear();
             return false;
         }
-        return enterListeningOrClose();
+        return enterListeningWhenPlaybackIdleOrClose();
     }
 
     pending_wake_word_.clear();
@@ -357,11 +427,9 @@ bool Client::closeSession() {
     if (!begun_ || ending_ || end_requested_) {
         return false;
     }
-    closing_ = true;
-    if (transport_.connected()) {
-        transport_.close();
-    }
-    closing_ = false;
+    cancelPlayback();
+    expected_close_ = true;
+    transport_.close();
     if (end_requested_) {
         return false;
     }
@@ -390,27 +458,34 @@ bool Client::sendAudio(const uint8_t* opus, size_t size, uint32_t timestamp) {
     if (end_requested_) {
         return false;
     }
-    if (!begun_ || ending_ || !session_ready_ ||
-        !transport_.connected() || !capture_enabled_ || !allowed) {
+    if (!begun_ || ending_ || !session_ready_ || !capture_enabled_ || !allowed) {
         reportError(ErrorCode::InvalidState,
                     "audio can only be sent while listening or in realtime speaking mode");
         return false;
     }
+    if (!transport_.connected()) {
+        handleTransportSendFailure("audio transport is disconnected");
+        return false;
+    }
 
-    std::vector<uint8_t> frame;
+    // Protocol v1 is the raw Opus payload. Avoid two copies (Client framing and
+    // ArduinoWebsockets aggregation) on the default protocol path.
+    if (config_.protocol_version == 1) {
+        if (opus == nullptr || size == 0 || size > config_.max_audio_payload_bytes) {
+            reportError(ErrorCode::InvalidAudioFrame, "Opus payload is empty or too large");
+            return false;
+        }
+        return sendTransportBinary(opus, size);
+    }
+
     std::string error;
-    if (!Protocol::encodeAudio(config_.protocol_version, opus, size, timestamp,
-                               config_.max_audio_payload_bytes, frame, error)) {
+    const uint32_t wire_timestamp = config_.enable_server_aec ? timestamp : 0;
+    if (!Protocol::encodeAudio(config_.protocol_version, opus, size, wire_timestamp,
+                               config_.max_audio_payload_bytes, audio_send_buffer_, error)) {
         reportError(ErrorCode::InvalidAudioFrame, error);
         return false;
     }
-    if (!transport_.sendBinary(frame.data(), frame.size())) {
-        if (!end_requested_) {
-            reportError(ErrorCode::TransportSendFailed, "failed to send an audio frame");
-        }
-        return false;
-    }
-    return !end_requested_;
+    return sendTransportBinary(audio_send_buffer_.data(), audio_send_buffer_.size());
 }
 
 bool Client::sendMcp(const std::string& json_rpc_payload) {
@@ -472,23 +547,30 @@ void Client::onTransportOpen() {
     if (!begun_ || end_requested_ || state_machine_.state() != State::Connecting) {
         return;
     }
+    expected_close_ = false;
     std::string hello;
     std::string error;
-    if (!Protocol::makeHello(config_, hello, error) || !sendText(hello)) {
+    if (!Protocol::makeHello(config_, hello, error)) {
         if (end_requested_) {
             return;
         }
-        if (!error.empty()) {
-            reportError(ErrorCode::InvalidConfiguration, error);
-        }
+        reportError(ErrorCode::InvalidConfiguration, error);
         if (!end_requested_) {
             closeSession();
         }
         return;
     }
+    // Publish handshake state before sendText(). A mock or future transport may
+    // synchronously deliver the server hello while the send call is still open.
     awaiting_hello_ = true;
     handshake_started_ms_ = clock_.nowMs();
     last_incoming_ms_ = handshake_started_ms_;
+    if (!sendText(hello)) {
+        awaiting_hello_ = false;
+        if (!end_requested_ && state_machine_.state() == State::Connecting) {
+            closeSession();
+        }
+    }
 }
 
 void Client::onTransportText(const uint8_t* data, size_t size) {
@@ -587,7 +669,22 @@ void Client::onTransportText(const uint8_t* data, size_t size) {
         if (tts_state == "start") {
             const State current = state_machine_.state();
             if (current == State::Listening || current == State::Idle) {
-                state_machine_.transitionTo(State::Speaking);
+                // A stale/competing start can arrive synchronously while a
+                // wake abort is still being sent. Until enterListening() moves
+                // the pending word into its wire message, keep the old
+                // generation suppressed and let the wake flow continue.
+                if (!(downlink_suppressed_ && !pending_wake_word_.empty())) {
+                    cancelPlayback();
+                    downlink_suppressed_ = false;
+                    state_machine_.transitionTo(State::Speaking);
+                }
+            } else if (current == State::Speaking && downlink_suppressed_) {
+                // Some servers start the replacement generation without an
+                // intermediate stop after acknowledging a local abort.
+                if (pending_wake_word_.empty()) {
+                    cancelPlayback();
+                    downlink_suppressed_ = false;
+                }
             }
         } else if (tts_state == "stop") {
             if (state_machine_.state() == State::Speaking) {
@@ -597,12 +694,7 @@ void Client::onTransportText(const uint8_t* data, size_t size) {
                     if (end_requested_) {
                         return;
                     }
-                    if (audio_port_started_ && audio_port_ != nullptr &&
-                        !audio_port_->playbackIdle()) {
-                        pending_listening_start_ = true;
-                    } else {
-                        enterListeningOrClose();
-                    }
+                    enterListeningWhenPlaybackIdleOrClose();
                 }
             }
         } else if (tts_state == "sentence_start") {
@@ -622,6 +714,7 @@ void Client::onTransportText(const uint8_t* data, size_t size) {
         Event event;
         event.type = EventType::Emotion;
         getString(root, "emotion", event.emotion);
+        event.emotion_type = emotionFromName(event.emotion);
         event.json.assign(reinterpret_cast<const char*>(data), size);
         emitEvent(std::move(event));
     } else if (type == "alert") {
@@ -634,6 +727,7 @@ void Client::onTransportText(const uint8_t* data, size_t size) {
                         "alert requires string status, message, and emotion fields");
             return;
         }
+        event.emotion_type = emotionFromName(event.emotion);
         event.json.assign(reinterpret_cast<const char*>(data), size);
         emitEvent(std::move(event));
     } else if (type == "mcp") {
@@ -646,11 +740,11 @@ void Client::onTransportText(const uint8_t* data, size_t size) {
             reportError(ErrorCode::InvalidMessage, "MCP envelope is missing an object payload");
             return;
         }
-        const std::string request = jsonString(payload);
         std::string response;
         std::string error;
         beginUserCallback();
-        const bool handled = mcp_server_.handle(request, response, error);
+        const bool handled =
+            mcp_server_.handle(payload.as<JsonObjectConst>(), response, error);
         endUserCallback();
         if (end_requested_) {
             return;
@@ -696,17 +790,26 @@ void Client::onTransportBinary(const uint8_t* data, size_t size) {
     if (!begun_ || end_requested_ || !session_ready_) {
         return;
     }
-    AudioFrame frame;
+    AudioFrameView view;
     std::string error;
-    if (!Protocol::decodeAudio(config_.protocol_version, data, size, server_audio_format_,
-                               config_.max_audio_payload_bytes, frame, error)) {
+    if (!Protocol::parseAudioView(config_.protocol_version, data, size,
+                                  server_audio_format_,
+                                  config_.max_audio_payload_bytes, view, error)) {
         reportError(ErrorCode::InvalidAudioFrame, error);
         return;
     }
+    // A valid binary frame proves channel activity even when its audio belongs
+    // to an aborted generation. The view lets us gate without allocating Opus.
     last_incoming_ms_ = clock_.nowMs();
-    if (!config_.deliver_audio_outside_speaking && state_machine_.state() != State::Speaking) {
+    if (downlink_suppressed_ ||
+        (!config_.deliver_audio_outside_speaking &&
+         state_machine_.state() != State::Speaking)) {
         return;
     }
+    AudioFrame frame;
+    frame.format = view.format;
+    frame.timestamp = view.timestamp;
+    frame.opus.assign(view.opus, view.opus + view.opus_size);
     if (callbacks_.on_audio) {
         beginUserCallback();
         callbacks_.on_audio(frame);
@@ -716,7 +819,7 @@ void Client::onTransportBinary(const uint8_t* data, size_t size) {
         }
     }
     if (audio_port_started_ && audio_port_ != nullptr) {
-        audio_port_->play(frame);
+        audio_port_->play(std::move(frame));
     }
 }
 
@@ -725,7 +828,19 @@ void Client::onTransportClose() {
     if (!begun_ || end_requested_) {
         return;
     }
-    const bool expected = closing_;
+    const bool expected = expected_close_;
+    if (expected) {
+        return;
+    }
+    if (state_machine_.state() == State::Idle && !session_ready_ &&
+        !awaiting_hello_) {
+        return;
+    }
+    cancelPlayback();
+    // A terminal event does not necessarily mean a custom Transport has
+    // discarded every already-queued callback. close() is the explicit barrier.
+    expected_close_ = true;
+    transport_.close();
     clearSession();
     const State current = state_machine_.state();
     if (current == State::Connecting || current == State::Listening ||
@@ -739,12 +854,21 @@ void Client::onTransportClose() {
 
 void Client::onTransportError(const std::string& message) {
     DispatchScope dispatch(*this);
+    if (expected_close_) {
+        return;
+    }
     if (begun_ && !end_requested_) {
-        reportError(ErrorCode::TransportDisconnected, message);
+        const State current = state_machine_.state();
+        if (current == State::Idle && !session_ready_ && !awaiting_hello_) {
+            return;
+        }
+        reportError(current == State::Connecting && !session_ready_
+                        ? ErrorCode::TransportConnectFailed
+                        : ErrorCode::TransportDisconnected,
+                    message);
         if (end_requested_) {
             return;
         }
-        const State current = state_machine_.state();
         if (current == State::Connecting || current == State::Listening ||
             current == State::Speaking || session_ready_) {
             closeSession();
@@ -777,17 +901,38 @@ bool Client::connectSession() {
     }
 
     handshake_started_ms_ = clock_.nowMs();
-    if (!transport_.connect(request)) {
+    expected_close_ = false;
+    deferred_text_chain_count_ = 0;
+    ++transport_call_depth_;
+    const bool connected = transport_.connect(request);
+    --transport_call_depth_;
+    if (!connected) {
+        // on_open from a transport that ultimately failed may have queued a
+        // hello. Never drain protocol work onto a failed connection.
+        deferred_text_sends_.clear();
+        deferred_text_bytes_ = 0;
         if (end_requested_) {
             return false;
         }
         if (state_machine_.state() == State::Connecting) {
             state_machine_.transitionTo(State::Idle);
+            if (end_requested_) {
+                return false;
+            }
+            // A transport that already emitted on_error moved the Client out
+            // of Connecting via onTransportError(). Avoid reporting the same
+            // failed handshake a second time in that case.
+            reportError(ErrorCode::TransportConnectFailed,
+                        "WebSocket connect request failed");
         }
-        if (end_requested_) {
-            return false;
+        pending_wake_word_.clear();
+        return false;
+    }
+    if (!drainDeferredTextSends()) {
+        if (!end_requested_ && begun_ &&
+            (state_machine_.state() == State::Connecting || session_ready_)) {
+            closeSession();
         }
-        reportError(ErrorCode::TransportConnectFailed, "WebSocket connect request failed");
         return false;
     }
     return !end_requested_;
@@ -802,6 +947,7 @@ bool Client::enterListening() {
         return false;
     }
 
+    const std::string active_session = session_id_;
     if (!pending_wake_word_.empty()) {
         std::string wake_message;
         const std::string wake_word = std::move(pending_wake_word_);
@@ -813,11 +959,36 @@ bool Client::enterListening() {
         if (end_requested_) {
             return false;
         }
+        // sendText() may synchronously dispatch a server response. If the
+        // server has already advanced this turn to Speaking, do not send a
+        // duplicate listen command or let the outer call close a valid session.
+        if (!begun_ || !session_ready_ || session_id_ != active_session) {
+            return false;
+        }
+        if (state_machine_.state() == State::Speaking) {
+            setCaptureEnabled(listening_mode_ == ListeningMode::Realtime);
+            return true;
+        }
+        if (state_machine_.state() != State::Listening) {
+            return false;
+        }
     }
 
     std::string message;
     if (!Protocol::makeStartListening(session_id_, listening_mode_, message) ||
-        !sendText(message)) {
+        !sendText(message, DeferredTextRequirement::Listening)) {
+        return false;
+    }
+    if (end_requested_ || !begun_ || !session_ready_ ||
+        session_id_ != active_session) {
+        return false;
+    }
+    const State state_after_send = state_machine_.state();
+    if (state_after_send == State::Speaking) {
+        setCaptureEnabled(listening_mode_ == ListeningMode::Realtime);
+        return true;
+    }
+    if (state_after_send != State::Listening) {
         return false;
     }
     setCaptureEnabled(true);
@@ -835,25 +1006,153 @@ bool Client::enterListeningOrClose() {
     return false;
 }
 
-bool Client::sendText(const std::string& text) {
+bool Client::enterListeningWhenPlaybackIdleOrClose() {
+    if (audio_port_started_ && audio_port_ != nullptr &&
+        !audio_port_->playbackIdle()) {
+        // Keep capture closed until the cancelled/finished I2S write and its
+        // short acoustic tail are gone. loop() resumes listening when idle.
+        setCaptureEnabled(false);
+        pending_listening_start_ = true;
+        return true;
+    }
+    pending_listening_start_ = false;
+    return enterListeningOrClose();
+}
+
+bool Client::sendText(const std::string& text,
+                      DeferredTextRequirement requirement) {
     if (end_requested_) {
         return false;
     }
-    if (!transport_.connected() || text.empty() || text.size() > config_.max_json_bytes) {
+    if (text.empty() || text.size() > config_.max_json_bytes) {
         reportError(ErrorCode::TransportSendFailed,
-                    "text message is empty, too large, or transport is disconnected");
+                    "text message is empty or exceeds the configured limit");
         return false;
     }
-    if (!transport_.sendText(reinterpret_cast<const uint8_t*>(text.data()), text.size())) {
-        if (!end_requested_) {
-            reportError(ErrorCode::TransportSendFailed, "failed to send a text message");
-        }
+    if (transport_call_depth_ != 0) {
+        return queueDeferredText(text, requirement);
+    }
+    deferred_text_chain_count_ = 0;
+    return sendTextNow(text) && drainDeferredTextSends();
+}
+
+bool Client::sendTextNow(const std::string& text) {
+    if (!transport_.connected()) {
+        handleTransportSendFailure("text transport is disconnected");
+        return false;
+    }
+    ++transport_call_depth_;
+    const bool sent =
+        transport_.sendText(reinterpret_cast<const uint8_t*>(text.data()), text.size());
+    --transport_call_depth_;
+    if (!sent) {
+        handleTransportSendFailure("failed to send a text message");
+        return false;
+    }
+    if (!transport_.connected()) {
+        handleTransportSendFailure("text transport closed while sending");
         return false;
     }
     return !end_requested_;
 }
 
+bool Client::queueDeferredText(const std::string& text,
+                               DeferredTextRequirement requirement) {
+    const size_t maximum_bytes = config_.max_json_bytes * 2U;
+    if (deferred_text_chain_count_ >= kMaximumDeferredTextSends ||
+        deferred_text_sends_.size() >= kMaximumDeferredTextSends ||
+        text.size() > maximum_bytes - std::min(maximum_bytes, deferred_text_bytes_)) {
+        handleTransportSendFailure(
+            "synchronous transport callbacks generated too many pending messages");
+        return false;
+    }
+    DeferredTextSend pending;
+    pending.text = text;
+    pending.session_generation = session_generation_;
+    pending.requirement = requirement;
+    deferred_text_sends_.push_back(std::move(pending));
+    deferred_text_bytes_ += text.size();
+    ++deferred_text_chain_count_;
+    return true;
+}
+
+bool Client::drainDeferredTextSends() {
+    while (!deferred_text_sends_.empty() && !end_requested_) {
+        DeferredTextSend pending = std::move(deferred_text_sends_.front());
+        deferred_text_sends_.erase(deferred_text_sends_.begin());
+        deferred_text_bytes_ -= pending.text.size();
+        if (pending.session_generation != session_generation_) {
+            continue;
+        }
+        if (pending.requirement == DeferredTextRequirement::Listening &&
+            (!session_ready_ || state_machine_.state() != State::Listening)) {
+            // A synchronous response has already advanced the turn. This is
+            // the queued equivalent of enterListening()'s post-send check.
+            if (session_ready_ && state_machine_.state() == State::Speaking) {
+                continue;
+            }
+            deferred_text_sends_.clear();
+            deferred_text_bytes_ = 0;
+            return false;
+        }
+        if (!sendTextNow(pending.text)) {
+            deferred_text_sends_.clear();
+            deferred_text_bytes_ = 0;
+            return false;
+        }
+    }
+    if (end_requested_) {
+        deferred_text_sends_.clear();
+        deferred_text_bytes_ = 0;
+        return false;
+    }
+    return true;
+}
+
+bool Client::sendTransportBinary(const uint8_t* data, size_t size) {
+    if (!transport_.connected()) {
+        handleTransportSendFailure("audio transport is disconnected");
+        return false;
+    }
+    if (transport_call_depth_ != 0) {
+        handleTransportSendFailure("audio transport send was recursively re-entered");
+        return false;
+    }
+    deferred_text_chain_count_ = 0;
+    ++transport_call_depth_;
+    const bool sent = transport_.sendBinary(data, size);
+    --transport_call_depth_;
+    if (!sent) {
+        handleTransportSendFailure("failed to send an audio frame");
+        return false;
+    }
+    if (!transport_.connected()) {
+        handleTransportSendFailure("audio transport closed while sending");
+        return false;
+    }
+    return !end_requested_ && drainDeferredTextSends();
+}
+
+void Client::handleTransportSendFailure(const char* message) {
+    if (!begun_ || ending_ || end_requested_) {
+        return;
+    }
+    const State current = state_machine_.state();
+    const bool active = current == State::Connecting || current == State::Listening ||
+                        current == State::Speaking || session_ready_ || awaiting_hello_;
+    // A synchronous on_close/on_error may already have reported and cleaned up
+    // the connection before send*() returns false.
+    if (!active) {
+        return;
+    }
+    reportError(ErrorCode::TransportSendFailed, message);
+    if (!end_requested_ && begun_ && !ending_) {
+        closeSession();
+    }
+}
+
 void Client::clearSession() {
+    ++session_generation_;
     awaiting_hello_ = false;
     session_ready_ = false;
     handshake_started_ms_ = 0;
@@ -861,7 +1160,16 @@ void Client::clearSession() {
     session_id_.clear();
     pending_wake_word_.clear();
     pending_listening_start_ = false;
+    downlink_suppressed_ = false;
+    deferred_text_sends_.clear();
+    deferred_text_bytes_ = 0;
     server_audio_format_ = AudioFormat{24000, 60, 1};
+}
+
+void Client::cancelPlayback() {
+    if (audio_port_started_ && audio_port_ != nullptr) {
+        audio_port_->cancelPlayback();
+    }
 }
 
 void Client::handleStateChange(State old_state, State new_state) {

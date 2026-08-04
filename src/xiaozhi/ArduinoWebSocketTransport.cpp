@@ -58,6 +58,11 @@ bool ArduinoWebSocketTransport::connect(const TransportRequest& request) {
     }
 
     client_ = std::make_unique<websockets::WebsocketsClient>();
+    // Aggregate fragments ourselves and close as soon as the cumulative limit
+    // is crossed. ArduinoWebsockets 0.5.4 still retains a second copy of the
+    // first fragmented message because its policy setter does not rebuild the
+    // existing StreamBuilder, but this callback bounds that copy as well.
+    client_->setFragmentsPolicy(websockets::FragmentsPolicy_Notify);
     if (secure) {
         client_->setCACert(ca_certificate_);
     }
@@ -65,35 +70,80 @@ bool ArduinoWebSocketTransport::connect(const TransportRequest& request) {
         client_->addHeader(String(header.first.c_str()), String(header.second.c_str()));
     }
 
-    client_->onMessage([this](websockets::WebsocketsMessage message) {
+    client_->onMessage([this](websockets::WebsocketsClient&,
+                              websockets::WebsocketsMessage message) {
+        if (!connected_ || close_pending_) {
+            return;
+        }
         const std::string& payload = message.rawData();
         constexpr size_t kHardMessageLimit = 16384;
-        if (payload.size() > kHardMessageLimit) {
+        const auto rejectOversizedMessage = [this]() {
             if (callbacks_.on_error) {
                 callbacks_.on_error("WebSocket message exceeds the 16384-byte hard limit");
             }
             close();
+        };
+
+        const bool partial = message.isPartial();
+        if (!partial) {
+            if (fragment_in_progress_ || payload.size() > kHardMessageLimit) {
+                fragment_buffer_.clear();
+                fragment_in_progress_ = false;
+                rejectOversizedMessage();
+                return;
+            }
+        } else if (message.isFirst()) {
+            fragment_buffer_.clear();
+            fragment_in_progress_ = true;
+            fragment_is_text_ = message.isText();
+        } else if (!fragment_in_progress_ || fragment_is_text_ != message.isText()) {
+            fragment_buffer_.clear();
+            fragment_in_progress_ = false;
+            if (callbacks_.on_error) {
+                callbacks_.on_error("WebSocket fragment sequence is invalid");
+            }
+            close();
             return;
         }
-        const uint8_t* data = reinterpret_cast<const uint8_t*>(payload.data());
-        if (message.isText()) {
-            if (callbacks_.on_text) {
-                callbacks_.on_text(data, payload.size());
+
+        if (partial) {
+            if (payload.size() > kHardMessageLimit - fragment_buffer_.size()) {
+                fragment_buffer_.clear();
+                fragment_in_progress_ = false;
+                rejectOversizedMessage();
+                return;
             }
-        } else if (message.isBinary() && callbacks_.on_binary) {
-            callbacks_.on_binary(data, payload.size());
+            fragment_buffer_.append(payload.data(), payload.size());
+            if (!message.isLast()) {
+                return;
+            }
+            fragment_in_progress_ = false;
+        }
+
+        const std::string& complete = partial ? fragment_buffer_ : payload;
+        const uint8_t* data = reinterpret_cast<const uint8_t*>(complete.data());
+        const bool is_text = partial ? fragment_is_text_ : message.isText();
+        if (is_text) {
+            if (callbacks_.on_text) {
+                callbacks_.on_text(data, complete.size());
+            }
+        } else if (callbacks_.on_binary) {
+            callbacks_.on_binary(data, complete.size());
         }
     });
-    client_->onEvent([this](websockets::WebsocketsEvent event, String data) {
+    client_->onEvent([this](websockets::WebsocketsClient&,
+                            websockets::WebsocketsEvent event, String data) {
         switch (event) {
             case websockets::WebsocketsEvent::ConnectionOpened:
                 connected_ = true;
-                if (callbacks_.on_open) {
-                    callbacks_.on_open();
-                }
                 break;
             case websockets::WebsocketsEvent::ConnectionClosed:
                 connected_ = false;
+                fragment_in_progress_ = false;
+                // A user may close from inside on_text/on_binary while its data
+                // still points into fragment_buffer_. Release only after the
+                // outermost ArduinoWebsockets call and callback have unwound.
+                fragment_release_pending_ = true;
                 if (!suppress_close_callback_ && callbacks_.on_close) {
                     callbacks_.on_close();
                 }
@@ -105,9 +155,13 @@ bool ArduinoWebSocketTransport::connect(const TransportRequest& request) {
         (void)data;
     });
 
+    // A failed handshake may synchronously emit ConnectionClosed. Treat that
+    // as part of connect(), not as a second established-session disconnect.
+    suppress_close_callback_ = true;
     beginClientCall();
     const bool opened = client_->connect(String(request.url.c_str()));
     endClientCall();
+    suppress_close_callback_ = false;
     if (!opened || !connected_) {
         connected_ = false;
         client_.reset();
@@ -115,6 +169,13 @@ bool ArduinoWebSocketTransport::connect(const TransportRequest& request) {
             callbacks_.on_error("WebSocket TCP/TLS handshake failed");
         }
         return false;
+    }
+    // ArduinoWebsockets emits ConnectionOpened from inside connect(). Notify
+    // the protocol only after connect() has fully returned; sending Xiaozhi's
+    // hello from the nested event callback can report success before the
+    // underlying WebSocket is ready and the frame is then never delivered.
+    if (callbacks_.on_open) {
+        callbacks_.on_open();
     }
     return connected_;
 #endif
@@ -164,10 +225,16 @@ bool ArduinoWebSocketTransport::sendBinary(const uint8_t* data, size_t size) {
 
 void ArduinoWebSocketTransport::close() {
 #if XIAOZHI_HAS_ARDUINO_WEBSOCKETS
+    const bool was_connected = connected_;
     suppress_close_callback_ = true;
     connected_ = false;
     if (client_call_depth_ != 0) {
         close_pending_ = true;
+        // Keep the object alive until the outer library call unwinds, but close
+        // its socket now so ArduinoWebsockets::poll() stops draining the batch.
+        if (was_connected && client_ != nullptr) {
+            client_->close();
+        }
         return;
     }
     closeNow();
@@ -175,6 +242,8 @@ void ArduinoWebSocketTransport::close() {
     client_.reset();
 #endif
     connected_ = false;
+    fragment_buffer_.clear();
+    fragment_in_progress_ = false;
 }
 
 void ArduinoWebSocketTransport::closeNow() {
@@ -191,6 +260,9 @@ void ArduinoWebSocketTransport::closeNow() {
 #endif
     connected_ = false;
     suppress_close_callback_ = false;
+    std::string().swap(fragment_buffer_);
+    fragment_in_progress_ = false;
+    fragment_release_pending_ = false;
 }
 
 void ArduinoWebSocketTransport::beginClientCall() {
@@ -207,6 +279,11 @@ void ArduinoWebSocketTransport::endClientCall() {
 void ArduinoWebSocketTransport::finishClientCall() {
     if (client_call_depth_ == 0 && close_pending_) {
         closeNow();
+    }
+    if (client_call_depth_ == 0 && fragment_release_pending_) {
+        std::string().swap(fragment_buffer_);
+        fragment_in_progress_ = false;
+        fragment_release_pending_ = false;
     }
 }
 

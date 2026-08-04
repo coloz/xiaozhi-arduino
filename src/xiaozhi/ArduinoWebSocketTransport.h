@@ -43,6 +43,10 @@ private:
     size_t client_call_depth_ = 0;
     bool close_pending_ = false;
     bool suppress_close_callback_ = false;
+    std::string fragment_buffer_;
+    bool fragment_in_progress_ = false;
+    bool fragment_is_text_ = false;
+    bool fragment_release_pending_ = false;
 };
 
 }  // namespace xiaozhi

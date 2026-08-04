@@ -8,6 +8,8 @@
 #include <variant>
 #include <vector>
 
+#include <ArduinoJson.h>
+
 namespace xiaozhi {
 
 enum class McpPropertyType : uint8_t {
@@ -107,6 +109,10 @@ public:
     void setUserToolAuthorizer(McpUserToolAuthorizer authorizer);
 
     bool handle(const uint8_t* data, size_t size, std::string& response,
+                std::string& error) const;
+    // Process an object already parsed by the Xiaozhi envelope parser. This
+    // avoids serializing and parsing the MCP payload a second time.
+    bool handle(JsonObjectConst request, std::string& response,
                 std::string& error) const;
     bool handle(const std::string& message, std::string& response, std::string& error) const {
         return handle(reinterpret_cast<const uint8_t*>(message.data()), message.size(), response,
