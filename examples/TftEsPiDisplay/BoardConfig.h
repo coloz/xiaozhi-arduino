@@ -13,6 +13,43 @@
 #define XIAOZHI_AUDIO_ENABLE_WAKE_ESP_SR 1
 #endif
 
+// Server-side AEC and voice barge-in are requested by default. After official
+// provisioning, v1/v3 are safely reduced to half-duplex by the timestamp check
+// below; v2 keeps realtime voice barge-in. The BOOT button and serial 't' can
+// always interrupt TTS manually.
+#ifndef XIAOZHI_ENABLE_SERVER_AEC_DEFAULT
+#define XIAOZHI_ENABLE_SERVER_AEC_DEFAULT 1
+#endif
+#ifndef XIAOZHI_ENABLE_VOICE_BARGE_IN_DEFAULT
+#define XIAOZHI_ENABLE_VOICE_BARGE_IN_DEFAULT 1
+#endif
+#if XIAOZHI_ENABLE_VOICE_BARGE_IN_DEFAULT && \
+    !XIAOZHI_ENABLE_SERVER_AEC_DEFAULT
+#error "Voice barge-in requires server AEC in this audio pipeline"
+#endif
+
+// Keep 0 to honor the protocol version supplied by official provisioning.
+// Set 1, 2, or 3 only when testing a server known to support that wire format.
+#ifndef XIAOZHI_PROTOCOL_VERSION_OVERRIDE
+#define XIAOZHI_PROTOCOL_VERSION_OVERRIDE 0
+#endif
+#if XIAOZHI_PROTOCOL_VERSION_OVERRIDE < 0 || \
+    XIAOZHI_PROTOCOL_VERSION_OVERRIDE > 3
+#error "XIAOZHI_PROTOCOL_VERSION_OVERRIDE must be 0, 1, 2, or 3"
+#endif
+
+// Protocol v1/v3 have no playback timestamp and can mistake speaker echo for a
+// user interruption. Keep this disabled for reliable full replies. Enabling it
+// forces Realtime mode on an untimestamped server and must be acoustically
+// validated on the final enclosure.
+#ifndef XIAOZHI_ALLOW_UNTIMESTAMPED_SERVER_AEC
+#define XIAOZHI_ALLOW_UNTIMESTAMPED_SERVER_AEC 0
+#endif
+#if XIAOZHI_ALLOW_UNTIMESTAMPED_SERVER_AEC != 0 && \
+    XIAOZHI_ALLOW_UNTIMESTAMPED_SERVER_AEC != 1
+#error "XIAOZHI_ALLOW_UNTIMESTAMPED_SERVER_AEC must be 0 or 1"
+#endif
+
 // Change this file to adapt the example to another ESP32-S3 board. The sample
 // values describe one 240x240 ST7789 display plus an ES8311 audio codec; they
 // are not tied to a board vendor.

@@ -294,6 +294,9 @@ struct I2sOpusAudioPort::Impl {
 
   int encoderInputBytes = 0;
   int encoderOutputBytes = 0;
+  // Only the codec task writes this maximum-sized buffer. Queued packets keep
+  // their actual encoded size instead of each retaining encoderOutputBytes.
+  std::vector<uint8_t> encoderScratch;
   size_t hardwareFramesPerPacket = 0;
   size_t captureSamplesPerPacket = 0;
   size_t inputChannels = 0;
@@ -1215,8 +1218,9 @@ struct I2sOpusAudioPort::Impl {
       capturePool.emplace_back(captureSamplesPerPacket);
     }
     for (size_t index = 0; index < config.maximumUplinkPackets + 1; ++index) {
-      uplinkPool.emplace_back(static_cast<size_t>(encoderOutputBytes));
+      uplinkPool.emplace_back();
     }
+    encoderScratch.resize(static_cast<size_t>(encoderOutputBytes));
     const size_t maximumPlaybackSamples =
         static_cast<size_t>(outputSampleRate()) * 60 / 1000 * outputChannels;
     for (size_t index = 0; index < config.maximumPlaybackChunks + 1; ++index) {
@@ -1243,13 +1247,13 @@ struct I2sOpusAudioPort::Impl {
 
       const uint32_t generation = wakeGeneration.load();
       if (wakeResetRequested.exchange(false)) {
-        // These objects and WakeNet's internal history are task-owned. Control
-        // code only publishes a reset request, avoiding concurrent clear/detect.
+        // Match the official standalone WakeNet wrapper: reset our task-owned
+        // PCM/resampler state, but do not call esp_wn_iface_t::clean(). The
+        // WakeNet 9 binary bundled with Arduino-ESP32 3.3.11-cn dereferences an
+        // internal 0xbaad5678 queue pointer from clean(), even after detect().
+        // Control code only publishes this request, avoiding clear/detect races.
         wakePcm.clear();
         wakeResampler.initialized = false;
-        if (wakeNet != nullptr && wakeNetData != nullptr && wakeNet->clean != nullptr) {
-          wakeNet->clean(wakeNetData);
-        }
       }
 
       size_t inputSamples = 0;
@@ -1846,6 +1850,7 @@ struct I2sOpusAudioPort::Impl {
     releaseVector(readBuffer32);
     releaseVector(writeBuffer32);
     releaseVector(decodeScratch);
+    std::vector<uint8_t>().swap(encoderScratch);
     releaseVector(wakeCaptured);
     releaseVector(wakeMono);
     releaseVector(wakeDetectChunk);
@@ -2114,7 +2119,7 @@ struct I2sOpusAudioPort::Impl {
       }
       xSemaphoreGive(queueMutex);
     }
-    packet.opus.resize(static_cast<size_t>(encoderOutputBytes));
+    packet.opus.clear();
     packet.timestamp = capture.timestamp;
     packet.timestampGeneration = capture.timestampGeneration;
     packet.generation = capture.generation;
@@ -2123,8 +2128,8 @@ struct I2sOpusAudioPort::Impl {
     input.buffer = reinterpret_cast<uint8_t*>(capture.pcm.data());
     input.len = static_cast<uint32_t>(capture.pcm.size() * sizeof(int16_t));
     esp_audio_enc_out_frame_t output{};
-    output.buffer = packet.opus.data();
-    output.len = static_cast<uint32_t>(packet.opus.size());
+    output.buffer = encoderScratch.data();
+    output.len = static_cast<uint32_t>(encoderScratch.size());
     const uint32_t encodeStartedUs = micros();
     const esp_audio_err_t result = esp_opus_enc_process(encoder, &input, &output);
     updateMaximum(maximumEncodeUs, micros() - encodeStartedUs);
@@ -2136,7 +2141,8 @@ struct I2sOpusAudioPort::Impl {
       }
       return;
     }
-    packet.opus.resize(output.encoded_bytes);
+    packet.opus.assign(encoderScratch.begin(),
+                       encoderScratch.begin() + output.encoded_bytes);
     bool queued = false;
     if (xSemaphoreTake(queueMutex, portMAX_DELAY) == pdTRUE) {
       // This commit check must stay inside the same critical section as the
@@ -2715,11 +2721,11 @@ bool I2sOpusAudioPort::begin(const xiaozhi::AudioFormat& captureFormat, Uplink u
       config.outputTaskStackBytes > 0 && config.performanceLogIntervalMs > 0 &&
       config.autoChannelSwitchRatio >= 1.0f &&
       config.captureLogIntervalPackets > 0 &&
-      (!config.enableSpeechConditioning ||
-       (config.speechGateRms > 0 && config.speechTargetRms > 0 &&
-        config.speechMaximumGain >= 1.0f && config.speechSilenceGain >= 0.0f &&
-         config.speechSilenceGain <= 1.0f && config.speechStartPackets > 0 &&
-         config.speechHoldMs > 0));
+       (!config.enableSpeechConditioning ||
+        (config.speechGateRms > 0 && config.speechTargetRms > 0 &&
+         config.speechMaximumGain >= 1.0f && config.speechSilenceGain >= 0.0f &&
+          config.speechSilenceGain <= 1.0f && config.speechStartPackets > 0 &&
+          config.speechHoldMs > 0));
   std::string hardwareError;
   const bool validHardwareConfig = impl_->validateHardwareConfig(hardwareError);
   const size_t inputChannels =

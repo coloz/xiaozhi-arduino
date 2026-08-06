@@ -20,7 +20,7 @@
 | 会话状态机、事件和标准表情枚举 | LVGL/U8g2/屏幕 UI |
 | WebSocket v1/v2/v3 编解码 | I2S 和具体音频 Codec 芯片 |
 | hello/listen/abort/STT/TTS/LLM 消息 | PCM↔Opus 编解码器与重采样 |
-| MCP 工具注册、参数校验和分页 | ESP-SR、WakeNet、VAD、AEC |
+| MCP 工具注册、参数校验、分页和服务端 AEC 协议 | ESP-SR、WakeNet、VAD、设备端 AFE/AEC |
 | OTA/激活配置解析与 HTTP 获取 | 摄像头、LED、按钮、电源管理 |
 | ESP32 MAC、持久 UUID、固件版本 | 字体、表情、OGG 和 assets 分区 |
 | 可注入 `Transport` / `EncodedAudioPort` | MQTT+UDP 传输扩展 |
@@ -106,6 +106,7 @@ callbacks.on_event = [](const xiaozhi::Event& event) {
 
 xiaozhi::ArduinoWebSocketTransport transport;
 xiaozhi::Client client(transport);
+xiaozhi::ClientRuntime runtime(client);
 
 void setup() {
   // 先连接 Wi-Fi。服务端配置留空时直接使用小智官方配置服务。
@@ -132,27 +133,56 @@ void setup() {
   callbacks.on_error = [](xiaozhi::ErrorCode, const std::string& message) {
     Serial.println(message.c_str());
   };
-  client.begin(config, callbacks);
+  if (runtime.begin(config, callbacks)) {
+    runtime.requestStartListening(xiaozhi::ListeningMode::AutoStop);
+  }
 }
 
 void loop() {
-  client.loop();
+  // 这里只派发用户回调；WebSocket、协议超时和音频上行在独立任务运行。
+  runtime.loop();
 }
 ```
 
-调用 `client.startListening()` 后建立会话。上行编码帧使用 `client.sendAudio()`；下行帧通过 `callbacks.on_audio` 返回。更推荐实现 `EncodedAudioPort` 并在 `begin()` 前调用 `client.attachAudioPort(&port)`，让音频扩展只处理 Opus 编解码和硬件队列。
+推荐 Arduino 应用使用 `ClientRuntime`。它把单写者 `Client`、WebSocket 轮询、协议超时和 `EncodedAudioPort::loop()` 固定在独立 FreeRTOS 任务；`requestStartListening()`、`requestToggleChat()`、`requestWakeWordDetected()` 等请求通过有界队列非阻塞提交。显示刷新、传感器读取或第三方库偶尔卡住 Arduino `loopTask` 时，小智链路仍继续运行。
+
+`runtime.loop()` 只限量派发用户回调，默认每次最多 4 个；即使暂时不调用，也只会延迟 UI/日志，不会停止协议和已挂接音频端口。回调队列满时会丢弃新回调而不阻塞实时任务，可用 `runtime.stats()` 查看命令/回调丢弃数和队列最高水位。不要在 Runtime 活动期间直接调用底层 `client`；改用 `request*` 方法。需要完全自定义调度或同步主机测试时，仍可不创建 Runtime，继续直接使用 `Client::loop()`。
+
+默认 Runtime 使用 8192 字节栈、优先级 2、固定到 core 0；活动会话每 2 ms 服务一次，空闲时降到 20 ms，命令仍会立即唤醒任务。可通过 `ClientRuntimeConfig` 调整。双核 Arduino 通常把 `loopTask` 放在 core 1，因此默认值能隔离大多数用户代码；单核芯片的有效 core 仍是 0。回调消息按需分配，设置 `on_audio` 会为了跨任务派发复制 Opus payload；已经挂接 `EncodedAudioPort` 且不需要观察原始下行包时，省略 `on_audio` 可减少热路径分配。
+
+更推荐实现 `EncodedAudioPort` 并在 `runtime.begin()` 前调用 `client.attachAudioPort(&port)`，让音频扩展处理 Opus 编解码和硬件队列。未使用音频端口的高级用法可直接用 `Client` 的同步 API 管理手工上行帧。
 
 `EncodedAudioPort` 还提供可选的移动播放、`cancelPlayback()` 和 `queuedPlaybackMs()` 钩子；旧扩展无需修改即可继续编译。实现取消钩子后，用户打断、TTS 新轮次、会话关闭或网络断开会立即废弃旧播放数据，避免缓冲语音继续播出。
 
-完整的 `TftEsPiDisplay` 音频示例将 I2S 采集、Opus 编解码和 I2S 输出放在独立任务中，`loop()` 只限量转交已编码的上行包，并让上行先于一次可能批量处理消息的 WebSocket 轮询。四条热路径队列使用预分配固定环，PCM/Opus 缓冲池复用；采集下采样使用按实际比例生成的 15-tap Q15 滤波器，48→24 kHz 播放使用流式 31-tap Q15 滤波器，上采样采用跨包连续的单样本延迟因果插值。上下行队列有时延上限并丢弃最旧数据，默认下行等待上限由 2400 ms 收紧为 600 ms。采集、唤醒、上行和播放均用代际号阻断旧会话数据，用户打断会先本地静音并等播放尾音消失后再开麦。会话仍连接时示例关闭 Wi-Fi 省电，以降低首包和连续对话抖动。这些策略针对 ESP32-S3 完整音频示例；核心库仍不隐式启用 AFE/AEC，是否使用服务端 AEC 或板级 ESP-SR AFE 应按硬件回声路径单独验证。
+完整的 `TftEsPiDisplay` 音频示例将 I2S 采集、Opus 编解码和 I2S 输出放在独立任务中，Runtime 任务限量批量转交已编码的上行包，并让上行先于一次可能批量处理消息的 WebSocket 轮询。四条热路径队列使用预分配固定环，PCM 缓冲池复用；Opus 编码只保留一个最大尺寸临时缓冲，排队包按实际编码长度占用内存。采集下采样使用按实际比例生成的 15-tap Q15 滤波器，48→24 kHz 播放使用流式 31-tap Q15 滤波器，上采样采用跨包连续的单样本延迟因果插值。上下行压缩包队列默认与官方 2.4.0 一致保留最多 2400 ms，既吸收 Wi-Fi/服务器突发，又在用户手动打断时由代际号立即废弃全部旧包。会话仍连接时示例关闭 Wi-Fi 省电，以降低首包和连续对话抖动。设备端 ESP-SR AFE/AEC 仍是板级扩展，必须按真实回声参考路径单独实现和验证。
 
-为兼容 2.4.0 原实现，`protocol_version` 默认是 1。只有服务端明确支持时才设置为 2 或 3；三种版本的 JSON 语义相同，二进制 Opus 头格式不同。`enable_server_aec` 只允许与协议 v2 一起使用；此时完整音频端口会把“已实际写入 I2S 的下行包时间戳”配给后续上行帧，`toggleChat()` 与唤醒入口默认使用 `Realtime`。未启用服务端 AEC 时，上行线协议时间戳固定为 0。
+为兼容 2.4.0 原实现，`protocol_version` 默认是 1。核心 `ClientConfig` 默认请求服务端 AEC/语音打断，但完整 TFT 示例只在服务端实际下发协议 v2 时启用 `Realtime`：v2 会把“已实际写入 I2S 的下行包时间戳”配给上行帧。v1/v3 没有该字段，实体测试会把扬声器回声误判为插话、造成回复只播几个字，因此示例自动回退 `AutoStop`，保证回复完整；BOOT 键、串口 `t` 和 `abortSpeaking()` 仍可立即手动打断。
+
+完整 TFT 示例可在 `BoardConfig.h` 用编译期宏配置：
+
+```cpp
+#define XIAOZHI_ENABLE_SERVER_AEC_DEFAULT 1
+#define XIAOZHI_ENABLE_VOICE_BARGE_IN_DEFAULT 1
+#define XIAOZHI_ALLOW_UNTIMESTAMPED_SERVER_AEC 0
+```
+
+运行期可逐个 Client 覆盖：
+
+```cpp
+xiaozhi::ClientConfig config;
+config.enable_server_aec = true;
+config.enable_voice_barge_in = true;
+```
+
+将两项都设为 `false` 即回到 `AutoStop` 半双工。只有确认自定义 v1/v3 服务端或设备端确实能消除回声时，才将 `XIAOZHI_ALLOW_UNTIMESTAMPED_SERVER_AEC` 设为 1；官方 v1 端点不应强制开启。语音打断要求有效 AEC；手动打断不受这些开关影响。
 
 ## 并发契约
 
+使用 `ClientRuntime` 时，底层 `Client` 只由 Runtime 任务访问。Arduino 任务和用户回调只能调用 `runtime.request*()`、读取 Runtime 的原子状态快照或调用 `runtime.loop()`；不要混用 `client.loop()` 或其他 Client 控制 API。`runtime.end()` 会等待服务任务退出并完成 Client/音频端口清理；若有限超时返回 `false`，对象仍保持有效，应稍后重试，不能提前销毁 Transport、Client 或音频端口。
+
 `Client::loop()` 是会话的单写者。自定义 `Transport` 可以从 `connect/send/close` 同步派发回调，也可以从其 `loop()` 派发，但所有调用必须在 Client 所在的同一任务，不能从隐藏的 RTOS 任务直接进入 Client。回调产生的协议文本会先进入小型有界队列，在当前 `connect/loop/send` 返回后发送，因此 Transport 不必支持递归 `send`；同步回调链超过上限会关闭会话，不能无限自激。`sendText/sendBinary` 返回前必须消费或复制输入数据，不能保留指针；`close()` 必须幂等、即使 `connected()==false` 也清除旧回调，并允许从同步回调请求（实现可延迟到当前调用栈退出后再销毁对象）。硬件中断和音频任务应先写入自己的有界队列，再由音频端口的 `loop()` 交给 Client；音频端口的 `end()` 返回前必须停止工作任务和全部上行回调。状态机本身带锁，并在释放锁后通知监听器，避免重入死锁。
 
-用户回调中不要直接调用 `startListening()`、`closeSession()`、`sendMcp()` 等控制 API；为防止递归状态转换，这些调用会返回失败。回调只设置一个 sketch 标志，再在 `client.loop()` 返回后执行控制动作。回调中调用 `end()` 会被安全延迟。
+直接使用 Client 时，用户回调中不要调用 `startListening()`、`closeSession()`、`sendMcp()` 等控制 API；为防止递归状态转换，这些调用会返回失败。可以设置 sketch 标志并在 `client.loop()` 返回后执行。使用 Runtime 时则可从回调提交 `runtime.request*()`。
 
 ## 安全和资源限制
 
@@ -167,4 +197,4 @@ void loop() {
 
 ## 当前兼容范围
 
-核心目标为 ESP32、ESP32-S3、ESP32-C3、ESP32-C5、ESP32-C6 和 ESP32-P4。WebSocket 会话、协议、MCP、配置解析和已编码 Opus 帧接口属于本库；具体音频硬件、Opus 实现、离线唤醒、UI 和 MQTT+UDP 是独立扩展边界。详见 [MIGRATION.md](MIGRATION.md) 和 [TESTING.md](TESTING.md)。
+核心目标为 ESP32、ESP32-S3、ESP32-C3、ESP32-C5、ESP32-C6 和 ESP32-P4。WebSocket 会话、协议、MCP、配置解析和已编码 Opus 帧接口属于本库；具体音频硬件、Opus 实现、离线唤醒、UI 和 MQTT+UDP 是独立扩展边界。详见 [PERFORMANCE.md](PERFORMANCE.md)、[MIGRATION.md](MIGRATION.md) 和 [TESTING.md](TESTING.md)。

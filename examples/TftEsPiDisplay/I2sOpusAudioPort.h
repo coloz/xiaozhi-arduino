@@ -322,14 +322,16 @@ class I2sOpusAudioPort final : public xiaozhi::EncodedAudioPort {
     CodecCallbacks codec;
 
     // Buffering and worker tasks.
-    // Realtime speech should not build multi-second backlogs. Six hundred
-    // milliseconds still absorbs ordinary Wi-Fi jitter while keeping aborts
-    // and state changes responsive.
-    uint16_t maximumDecodeQueueMs = 600;
+    // Match xiaozhi-esp32 2.4.0's 2400 ms compressed-packet queues. Playback
+    // still starts immediately and cancelPlayback() invalidates the complete
+    // backlog, so this absorbs Wi-Fi/server bursts without slowing barge-in.
+    uint16_t maximumDecodeQueueMs = 2400;
     size_t maximumPlaybackChunks = 2;
     size_t maximumEncodePackets = 2;
-    size_t maximumUplinkPackets = 3;
-    size_t uplinkPacketsPerLoop = 1;
+    // Forty packets is 2400 ms with the official/default 60 ms Opus frame.
+    size_t maximumUplinkPackets = 40;
+    // Keep work bounded, but drain faster than capture after a short stall.
+    size_t uplinkPacketsPerLoop = 4;
     uint32_t inputTaskStackBytes = 8 * 1024;
     uint32_t decoderTaskStackBytes = 32 * 1024;
     uint32_t outputTaskStackBytes = 4096;

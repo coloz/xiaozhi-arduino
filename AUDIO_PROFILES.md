@@ -389,6 +389,8 @@ input.rightShift = 12;
 
 因此，文档和代码不提供不存在的 `XIAOZHI_AUDIO_PROFILE_ES7210` 或 `XIAOZHI_AUDIO_PROFILE_ES8388` 宏。后续若增加 ES7210，应先实现并验证独立的 TDM RX 后端；若增加 ES8388，应同时实现控制驱动、参考通道语义和对应硬件测试，而不只是增加一个别名。
 
+这里的限制仅指设备端 AFE/AEC。完整示例在协议 v2 下默认开启服务端 AEC 和语音打断；v1/v3 因没有播放时间戳而自动回退 `AutoStop`，避免扬声器回声造成回复自打断。可用 `XIAOZHI_ALLOW_UNTIMESTAMPED_SERVER_AEC=1` 强制打开，但必须在最终硬件上验证；按键/串口手动打断始终保留。
+
 ## 硬件验收清单
 
 ### 上电前

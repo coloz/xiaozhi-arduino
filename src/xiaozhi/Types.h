@@ -98,9 +98,12 @@ struct ClientConfig {
     size_t max_json_bytes = 8192;
     size_t max_audio_payload_bytes = 4096;
     bool enable_mcp = true;
-    // Server AEC uses protocol-v2 timestamps. A compatible audio port should
-    // return the timestamp of a downlink frame after it reaches playback I/O.
-    bool enable_server_aec = false;
+    // Server AEC is advertised for protocol v1/v2/v3. Protocol v2 additionally
+    // carries the timestamp of a downlink frame after it reaches playback I/O.
+    bool enable_server_aec = true;
+    // When enabled with server AEC, toggleChat() and wake-word entry use
+    // Realtime mode so capture remains active while TTS is playing.
+    bool enable_voice_barge_in = true;
     bool deliver_audio_outside_speaking = false;
 };
 

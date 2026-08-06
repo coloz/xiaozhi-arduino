@@ -20,7 +20,7 @@ Rather than copying the entire original ESP-IDF project into Arduino, it retains
 | Session state machine, events, and standard emotion enum | LVGL/U8g2/display UI |
 | WebSocket v1/v2/v3 encoding and decoding | I2S and specific audio codec chips |
 | hello/listen/abort/STT/TTS/LLM messages | PCM-to-Opus/Opus-to-PCM codecs and resampling |
-| MCP tool registration, argument validation, and pagination | ESP-SR, WakeNet, VAD, and AEC |
+| MCP registration, validation, pagination, and server-AEC protocol | ESP-SR, WakeNet, VAD, and device-side AFE/AEC |
 | OTA/activation configuration parsing and HTTP retrieval | Cameras, LEDs, buttons, and power management |
 | ESP32 MAC address, persistent UUID, and firmware version | Fonts, emoji, OGG files, and asset partitions |
 | Injectable `Transport` / `EncodedAudioPort` | MQTT+UDP transport extensions |
@@ -113,6 +113,7 @@ the screen and animation path can be tested first.
 
 xiaozhi::ArduinoWebSocketTransport transport;
 xiaozhi::Client client(transport);
+xiaozhi::ClientRuntime runtime(client);
 
 void setup() {
   // Connect to Wi-Fi first. Leaving the service configuration empty uses the
@@ -141,27 +142,57 @@ void setup() {
   callbacks.on_error = [](xiaozhi::ErrorCode, const std::string& message) {
     Serial.println(message.c_str());
   };
-  client.begin(config, callbacks);
+  if (runtime.begin(config, callbacks)) {
+    runtime.requestStartListening(xiaozhi::ListeningMode::AutoStop);
+  }
 }
 
 void loop() {
-  client.loop();
+  // Only user callbacks run here. WebSocket, timeouts, and audio uplink run on
+  // the dedicated Xiaozhi task.
+  runtime.loop();
 }
 ```
 
-Call `client.startListening()` to establish a session. Send encoded upstream frames with `client.sendAudio()`; downstream frames are returned through `callbacks.on_audio`. The recommended approach is to implement `EncodedAudioPort` and call `client.attachAudioPort(&port)` before `begin()`, so that the audio extension is responsible only for Opus encoding/decoding and hardware queues.
+`ClientRuntime` is recommended for Arduino applications. It keeps the single-writer `Client`, WebSocket polling, protocol timeouts, and `EncodedAudioPort::loop()` on a dedicated FreeRTOS task. Calls such as `requestStartListening()`, `requestToggleChat()`, and `requestWakeWordDetected()` submit non-blocking work through a bounded queue. A temporarily slow display refresh, sensor read, or third-party library on Arduino's `loopTask` therefore does not stop the Xiaozhi data path.
+
+`runtime.loop()` only dispatches a bounded number of user callbacks (four by default). Delaying it postpones UI/log callbacks but does not stop protocol or attached-audio servicing. A full callback queue drops a new callback instead of blocking the real-time task; `runtime.stats()` exposes drops and queue high-water marks. Do not call the underlying `client` while its Runtime is active. Code that needs fully custom scheduling or deterministic synchronous tests can omit Runtime and continue to drive `Client::loop()` directly.
+
+The default Runtime uses an 8192-byte stack, priority 2, and core 0. It services active sessions every 2 ms, backs off to 20 ms while idle, and still wakes immediately for commands; all values are configurable through `ClientRuntimeConfig`. Arduino normally runs `loopTask` on core 1 on dual-core parts, while core 0 remains valid on single-core chips. Callback messages are allocated on demand. Deferring `on_audio` requires copying its Opus payload across tasks, so omit that observer when an attached `EncodedAudioPort` already owns playback and raw downlink packets are not needed.
+
+The recommended audio integration is to implement `EncodedAudioPort` and call `client.attachAudioPort(&port)` before `runtime.begin()`. Advanced applications without an audio port can still use the synchronous `Client` API for manually supplied uplink frames.
 
 `EncodedAudioPort` also has optional move-aware playback, `cancelPlayback()`, and `queuedPlaybackMs()` hooks; existing extensions remain source compatible. Implementing cancellation lets a user abort, a new TTS turn, session closure, or a transport disconnect invalidate buffered speech immediately instead of playing stale audio.
 
-The complete `TftEsPiDisplay` audio example runs I2S capture, Opus codec work, and I2S output on separate tasks; `loop()` forwards only a bounded number of encoded uplink packets and services uplink before a WebSocket poll that may process a batch. Its four hot queues are preallocated fixed rings and its PCM/Opus pools are reused. Capture downsampling uses a generated 15-tap Q15 filter, 48-to-24 kHz playback uses a streaming 31-tap Q15 filter, and upsampling uses cross-packet causal interpolation with one source-sample delay. Both directions remain latency-bounded and drop oldest data; the default downlink cap is reduced from 2400 ms to 600 ms. Capture, wake, uplink, and playback generations prevent stale data from crossing a turn; a user abort mutes locally first and reopens the microphone only after the playback tail is idle. The sketch keeps Wi-Fi power saving disabled while a session remains connected to reduce first-packet and conversational jitter. These policies apply to the ESP32-S3 full-audio example. The core still does not enable AFE/AEC implicitly; server AEC or a board-specific ESP-SR AFE must be validated against the actual acoustic path.
+The complete `TftEsPiDisplay` audio example runs I2S capture, Opus codec work, and I2S output on separate tasks; the Runtime task forwards a bounded batch of encoded uplink packets before WebSocket polling. Its hot queues are preallocated fixed rings and PCM buffers are pooled. Opus encoding keeps one scratch buffer while queued packets retain only their actual encoded length. The sketch keeps Wi-Fi power saving disabled during a session. Device-side ESP-SR AFE/AEC remains a board extension that needs a real playback-reference path and hardware validation.
 
-For compatibility with the original 2.4.0 implementation, `protocol_version` defaults to 1. Set it to 2 or 3 only when the server explicitly supports that version. All three versions have the same JSON semantics but use different binary Opus header formats. `enable_server_aec` is accepted only with protocol v2; the full audio port then associates the timestamp of a downlink packet that has actually reached I2S with a following uplink frame, and `toggleChat()` and wake-word entry default to `Realtime`. Without server AEC, the wire timestamp for uplink audio is always zero.
+For compatibility with 2.4.0, `protocol_version` defaults to 1. Core `ClientConfig` requests server AEC and voice barge-in by default, but the complete TFT examples enter `Realtime` only when provisioning actually selects protocol v2, whose uplink frames carry played-downlink timestamps. Hardware testing showed that the official v1 endpoint mistakes speaker echo for barge-in and stops replies after a few syllables, so v1/v3 automatically use `AutoStop`. Button, serial, and `abortSpeaking()` interruption remain available.
+
+The complete TFT examples expose compile-time switches in `BoardConfig.h`:
+
+```cpp
+#define XIAOZHI_ENABLE_SERVER_AEC_DEFAULT 1
+#define XIAOZHI_ENABLE_VOICE_BARGE_IN_DEFAULT 1
+#define XIAOZHI_ALLOW_UNTIMESTAMPED_SERVER_AEC 0
+```
+
+Or override one Client at runtime:
+
+```cpp
+xiaozhi::ClientConfig config;
+config.enable_server_aec = true;
+config.enable_voice_barge_in = true;
+```
+
+Set both fields to `false` for half-duplex `AutoStop`. Set `XIAOZHI_ALLOW_UNTIMESTAMPED_SERVER_AEC` to 1 only for a custom v1/v3 server or device path that has been acoustically verified; do not force it with the official v1 endpoint. Manual interruption remains independent of these switches.
 
 ## Concurrency Contract
 
+With `ClientRuntime`, only its service task accesses the underlying `Client`. Arduino tasks and user callbacks must use `runtime.request*()`, read Runtime's atomic state snapshots, or call `runtime.loop()`; do not mix in `client.loop()` or Client control calls. `runtime.end()` waits for service-task exit and Client/audio teardown. If a finite timeout returns `false`, the Runtime is still valid: retry later and do not destroy its Transport, Client, or audio port early.
+
 `Client::loop()` is the sole writer for the session. A custom `Transport` may dispatch callbacks synchronously from `connect/send/close` or from its `loop()`, but every call must run on the same task as Client and never enter Client from a hidden RTOS task. Protocol text produced by a callback is kept in a small bounded queue and sent after the active `connect/loop/send` returns, so a Transport need not support recursive `send`; an overlong synchronous callback chain closes the session instead of self-triggering forever. `sendText/sendBinary` must consume or copy their input before returning and must not retain the pointer. `close()` must be idempotent, quiesce old callbacks even when `connected()==false`, and accept a request from a synchronous callback (destruction may be deferred until the active call unwinds). Hardware interrupts and audio tasks should first write to their own bounded queues, which the audio port's `loop()` then passes to Client; an audio port's `end()` must stop its workers and all uplink callbacks before returning. The state machine itself is protected by a lock and notifies listeners only after releasing it, preventing reentrant deadlocks.
 
-Do not call control APIs such as `startListening()`, `closeSession()`, or `sendMcp()` directly from a user callback. These calls fail to prevent recursive state transitions. Instead, have the callback set a flag in the sketch, then perform the control action after `client.loop()` returns. Calling `end()` from a callback is safely deferred.
+When using Client directly, do not call control APIs such as `startListening()`, `closeSession()`, or `sendMcp()` from a user callback. These calls fail to prevent recursive state transitions. Set a sketch flag and act after `client.loop()` returns. With Runtime, callbacks may instead submit `runtime.request*()` operations.
 
 ## Security and Resource Limits
 
@@ -176,4 +207,4 @@ The built-in adapter switches ArduinoWebsockets 0.5.x to fragment notifications 
 
 ## Current Compatibility Scope
 
-The core targets ESP32, ESP32-S3, ESP32-C3, ESP32-C5, ESP32-C6, and ESP32-P4. WebSocket sessions, protocols, MCP, provisioning parsing, and the encoded Opus frame interface belong to this library. Specific audio hardware, Opus implementations, offline wake-word detection, UI, and MQTT+UDP remain separate extension boundaries. See [MIGRATION.md](MIGRATION.md) and [TESTING.md](TESTING.md) for details.
+The core targets ESP32, ESP32-S3, ESP32-C3, ESP32-C5, ESP32-C6, and ESP32-P4. WebSocket sessions, protocols, MCP, provisioning parsing, and the encoded Opus frame interface belong to this library. Specific audio hardware, Opus implementations, offline wake-word detection, UI, and MQTT+UDP remain separate extension boundaries. See [PERFORMANCE.md](PERFORMANCE.md), [MIGRATION.md](MIGRATION.md), and [TESTING.md](TESTING.md) for details.

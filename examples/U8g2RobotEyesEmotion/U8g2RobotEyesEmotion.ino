@@ -107,8 +107,9 @@ void updateDemo(uint32_t now) {
 
 }  // namespace
 
-// Keep Client after callback-owned state so its destructor runs first.
+// Keep Runtime after Client and callback-owned state so it stops first.
 xiaozhi::Client client(transport);
+xiaozhi::ClientRuntime runtime(client);
 
 void setup() {
   Serial.begin(115200);
@@ -166,20 +167,20 @@ void setup() {
                   message.c_str());
   };
 
-  if (!client.begin(config, callbacks)) {
+  if (!runtime.begin(config, callbacks)) {
     queueLocalEmotion("shocked");
     return;
   }
 
   // Starts a session so the server can send LLM emotion events.
-  client.startListening(xiaozhi::ListeningMode::AutoStop);
+  runtime.requestStartListening(xiaozhi::ListeningMode::AutoStop);
 }
 
 void loop() {
-  client.loop();
+  runtime.loop();
   updateDemo(millis());
 
-  // Apply display work after Client::loop() has returned from callbacks.
+  // Apply display work after Runtime::loop() has dispatched callbacks.
   if (expressionPending) {
     expressionPending = false;
     currentEmotionName = pendingEmotionName;
@@ -192,7 +193,7 @@ void loop() {
     lastHeartbeatMs = now;
     Serial.printf(
         "[heartbeat] wifi=%d client=%s emotion=%u,%s display=%u,%s heap=%lu\n",
-        static_cast<int>(WiFi.status()), client.stateName(),
+        static_cast<int>(WiFi.status()), runtime.stateName(),
         static_cast<unsigned>(currentEmotion),
         xiaozhi::emotionName(currentEmotion),
         static_cast<unsigned>(eyes.xiaozhiExpression()),

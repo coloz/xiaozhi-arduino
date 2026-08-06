@@ -75,8 +75,9 @@ void onEvent(const xiaozhi::Event& event) {
 }
 }  // namespace
 
-// Keep Client after callback-owned strings so its destructor runs first.
+// Keep Runtime after Client and callback-owned strings so it stops first.
 xiaozhi::Client client(transport);
+xiaozhi::ClientRuntime runtime(client);
 
 void setup() {
   Serial.begin(115200);
@@ -108,13 +109,13 @@ void setup() {
     setMessage(message);
   };
 
-  if (client.begin(config, callbacks)) {
-    client.startListening(xiaozhi::ListeningMode::AutoStop);
+  if (runtime.begin(config, callbacks)) {
+    runtime.requestStartListening(xiaozhi::ListeningMode::AutoStop);
   }
 }
 
 void loop() {
-  client.loop();
+  runtime.loop();
   const uint32_t now = millis();
   if (displayDirty && now - lastDrawMs >= 80) {
     displayDirty = false;

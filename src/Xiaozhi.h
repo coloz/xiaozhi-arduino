@@ -8,6 +8,7 @@
 #include "xiaozhi/ArduinoWebSocketTransport.h"
 #include "xiaozhi/Audio.h"
 #include "xiaozhi/Client.h"
+#include "xiaozhi/ClientRuntime.h"
 #include "xiaozhi/Clock.h"
 #include "xiaozhi/Emotion.h"
 #include "xiaozhi/Esp32Identity.h"

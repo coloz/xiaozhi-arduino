@@ -64,6 +64,19 @@ WebSocket 分支时将 `_WS_CONFIG_MAX_MESSAGE_SIZE=16384` 同时传给依赖库
 
 ## 实时音频性能验收
 
+### Runtime 隔离压力测试
+
+所有公开示例默认使用 `ClientRuntime`。实体板验收时应在会话期间故意让 Arduino
+`loop()` 每 2 秒阻塞 100–300 ms（模拟全屏刷新、慢传感器或文件操作），同时确认：
+
+- WebSocket 不断线，握手和 channel timeout 不被误触发；
+- 音频上行/下行队列不持续增长，稳定网络下不丢包；
+- `runtime.stats().commands_rejected` 和 `callbacks_dropped` 保持为 0；
+- 阻塞只延迟 UI/日志回调，不延迟已挂接 `EncodedAudioPort` 的实际播放；
+- 在单核 C3/C5/C6 上，默认 priority 2 的 Runtime 能抢占 loopTask，但用户不能再创建同等或更高优先级且不阻塞的任务独占 core 0。
+
+再做回调过载测试：临时暂停 `runtime.loop()` 直到回调队列达到上限，确认协议和音频任务仍运行、丢弃计数可见、恢复派发后状态快照是最新值。该测试会故意丢 UI 回调，不应用于音质判定。
+
 ### 编译期音频 Profile
 
 发布前至少为 ESP32-S3 分别构建以下组合；Profile 宏必须通过
@@ -96,6 +109,8 @@ WebSocket 分支时将 `_WS_CONFIG_MAX_MESSAGE_SIZE=16384` 同时传给依赖库
 - 最低自由堆建议保留至少 32 KiB，最大连续块应高于应用运行期最大单次分配；三个任务的栈余量不应逼近 0。不同 Arduino-ESP32 版本需确认栈水位单位。
 - 对比优化前后记录唤醒到 Listening、说完到首个 TTS 音频、打断到静音的 P50/P95；不能用编译成功代替板上延迟和音质验收。
 - 协议 v2 服务端 AEC 模式下，抓取上行头确认 timestamp 来自已播放的下行包；取消播放后旧 timestamp 不得重新出现。
+- 协议 v2 默认服务端 AEC/语音打断模式下，hello 应包含 `features.aec=true`，listen mode 应为 `realtime`，进入 Speaking 后 capture 应保持开启；说话打断后旧 TTS 应立即静音。v1/v3 默认必须回退 `auto`；只有设置 `XIAOZHI_ALLOW_UNTIMESTAMPED_SERVER_AEC=1` 才测试实时模式，并必须确认不会被自身扬声器误打断。
+- 将 `XIAOZHI_ENABLE_SERVER_AEC_DEFAULT` 和 `XIAOZHI_ENABLE_VOICE_BARGE_IN_DEFAULT` 同时设为 0 编译一次，确认 listen mode 回到 `auto`、Speaking 时 capture 关闭，但 BOOT/串口手动打断仍可用。
 
 ## 尚需实体硬件验证
 

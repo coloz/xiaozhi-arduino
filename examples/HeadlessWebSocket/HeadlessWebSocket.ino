@@ -30,6 +30,7 @@ REPLACE_WITH_YOUR_SERVER_ROOT_CA
 
 xiaozhi::ArduinoWebSocketTransport transport;
 xiaozhi::Client client(transport);
+xiaozhi::ClientRuntime runtime(client);
 }  // namespace
 
 void setup() {
@@ -64,14 +65,16 @@ void setup() {
     Serial.printf("error[%s]: %s\n", xiaozhi::errorName(code), message.c_str());
   };
 
-  if (!client.begin(config, callbacks)) {
+  if (!runtime.begin(config, callbacks)) {
     Serial.println("Xiaozhi configuration failed");
     return;
   }
-  client.startListening(xiaozhi::ListeningMode::AutoStop);
+  runtime.requestStartListening(xiaozhi::ListeningMode::AutoStop);
 }
 
 void loop() {
-  client.loop();
+  // Only user callbacks run here. WebSocket and protocol work continue on the
+  // dedicated Xiaozhi task even if application code below is temporarily slow.
+  runtime.loop();
   delay(1);
 }

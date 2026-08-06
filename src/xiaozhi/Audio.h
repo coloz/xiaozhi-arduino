@@ -35,7 +35,8 @@ public:
 
 // A complete optional audio extension exchanges encoded frames with Client.
 // Client and Transport are single-task APIs: worker tasks may fill private
-// queues, but Uplink must be invoked by loop() on the same task as Client::loop().
+// queues, but Uplink must be invoked by loop() on the same task as Client::loop()
+// (the ClientRuntime service task when a runtime owns the Client).
 // end() must stop workers and quiesce every pending Uplink before returning.
 class EncodedAudioPort {
 public:

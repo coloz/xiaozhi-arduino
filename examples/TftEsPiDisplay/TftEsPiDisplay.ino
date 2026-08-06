@@ -273,22 +273,23 @@ void onEvent(const xiaozhi::Event& event) {
 }
 }  // namespace
 
-// Keep Client after callback-owned strings so its destructor runs first.
+// Keep Runtime after Client and callback-owned strings so it stops first.
 xiaozhi::Client client(transport);
+xiaozhi::ClientRuntime runtime(client);
 
 void toggleDialogue(const char* source) {
-  if (!client.ready()) {
+  if (!runtime.ready()) {
     Serial.printf("[xiaozhi] %s ignored: client is not ready\n", source);
     return;
   }
-  if (client.state() == xiaozhi::State::Connecting) {
+  if (runtime.state() == xiaozhi::State::Connecting) {
     Serial.printf("[xiaozhi] %s ignored: already connecting\n", source);
     return;
   }
   Serial.printf("[xiaozhi] dialogue toggle from %s\n", source);
-  if (!client.toggleChat()) {
+  if (!runtime.requestToggleChat()) {
     Serial.printf("[xiaozhi] dialogue toggle from %s failed in state=%s\n",
-                  source, client.stateName());
+                  source, runtime.stateName());
   }
 }
 
@@ -296,10 +297,10 @@ void pollDialogueTriggers() {
   std::string wakeWord;
   if (audioPort.consumeWakeWord(wakeWord)) {
     Serial.printf("[wake] detected: %s\n", wakeWord.c_str());
-    if (!client.ready() || client.state() != xiaozhi::State::Idle ||
-        !client.wakeWordDetected(wakeWord)) {
+    if (!runtime.ready() || runtime.state() != xiaozhi::State::Idle ||
+        !runtime.requestWakeWordDetected(wakeWord)) {
       Serial.printf("[wake] could not enter dialogue from state=%s\n",
-                    client.stateName());
+                    runtime.stateName());
     }
   }
 
@@ -422,12 +423,30 @@ void setup() {
                   provisioningError.c_str());
     return;
   }
+#if XIAOZHI_PROTOCOL_VERSION_OVERRIDE != 0
+  config.protocol_version = XIAOZHI_PROTOCOL_VERSION_OVERRIDE;
+#endif
+  const bool aecRequested = XIAOZHI_ENABLE_SERVER_AEC_DEFAULT != 0;
+  const bool timedServerAec = config.protocol_version == 2;
+  const bool allowUntimestampedAec =
+      XIAOZHI_ALLOW_UNTIMESTAMPED_SERVER_AEC != 0;
+  config.enable_server_aec =
+      aecRequested && (timedServerAec || allowUntimestampedAec);
+  config.enable_voice_barge_in =
+      XIAOZHI_ENABLE_VOICE_BARGE_IN_DEFAULT != 0 &&
+      config.enable_server_aec;
   Serial.println("[network] clock synchronized");
   Serial.printf("[xiaozhi] device=%s client=%s\n",
                 config.device_id.c_str(), config.client_id.c_str());
   Serial.printf("[xiaozhi] official WebSocket received, protocol v%u, token present=%s\n",
-                provisioning.websocket.version,
+                config.protocol_version,
                 provisioning.websocket.token.empty() ? "no" : "yes");
+  Serial.printf("[audio] server AEC=%s voice barge-in=%s\n",
+                config.enable_server_aec ? "on" : "off",
+                config.enable_voice_barge_in ? "on" : "off");
+  if (aecRequested && !config.enable_server_aec) {
+    Serial.println("[audio] protocol has no AEC timestamp; using AutoStop to prevent echo self-interruption");
+  }
   if (provisioning.activation.present && !provisioning.activation.code.empty()) {
     statusLine = "activation";
     setMessage("xiaozhi.me", provisioning.activation.code);
@@ -444,7 +463,7 @@ void setup() {
     statusLine = xiaozhi::stateName(next);
     displayDirty = true;
     Serial.printf("[xiaozhi] state=%s\n", xiaozhi::stateName(next));
-    const bool lowLatencySession = client.sessionReady() ||
+    const bool lowLatencySession = runtime.sessionReady() ||
                                    next == xiaozhi::State::Connecting ||
                                    next == xiaozhi::State::Listening ||
                                    next == xiaozhi::State::Speaking;
@@ -480,7 +499,7 @@ void setup() {
     Serial.println("[audio] failed to attach the I2S/Opus audio port");
     return;
   }
-  if (client.begin(config, callbacks)) {
+  if (runtime.begin(config, callbacks)) {
     Serial.println("[xiaozhi] client started");
     statusLine = "idle";
     if (!provisioning.activation.present || provisioning.activation.code.empty()) {
@@ -493,16 +512,16 @@ void setup() {
 }
 
 void loop() {
-  client.loop();
+  runtime.loop();
   pollDialogueTriggers();
   const uint32_t now = millis();
-  if (client.ready() && client.state() == xiaozhi::State::Speaking &&
+  if (runtime.ready() && runtime.state() == xiaozhi::State::Speaking &&
       lastSpeakingAudioMs != 0 &&
       now - lastSpeakingAudioMs >= kSpeakingSilenceTimeoutMs &&
       audioPort.playbackIdle()) {
     Serial.println("[xiaozhi] speaking watchdog: no TTS audio, closing stale session");
     lastSpeakingAudioMs = 0;
-    client.closeSession();
+    runtime.requestCloseSession();
   }
   if (displayDirty && now - lastDrawMs >= 50) {
     displayDirty = false;

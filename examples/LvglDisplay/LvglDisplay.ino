@@ -48,6 +48,7 @@ lv_obj_t* roleLabel = nullptr;
 lv_obj_t* messageLabel = nullptr;
 xiaozhi::ArduinoWebSocketTransport transport;
 xiaozhi::Client client(transport);
+xiaozhi::ClientRuntime runtime(client);
 
 void flushDisplay(lv_display_t* display, const lv_area_t* area, uint8_t* pixels) {
   const uint32_t width = static_cast<uint32_t>(area->x2 - area->x1 + 1);
@@ -152,13 +153,13 @@ void setup() {
     setMessage("system", message);
   };
 
-  if (client.begin(config, callbacks)) {
-    client.startListening(xiaozhi::ListeningMode::AutoStop);
+  if (runtime.begin(config, callbacks)) {
+    runtime.requestStartListening(xiaozhi::ListeningMode::AutoStop);
   }
 }
 
 void loop() {
-  client.loop();
+  runtime.loop();
   lv_timer_handler();
   delay(2);
 }

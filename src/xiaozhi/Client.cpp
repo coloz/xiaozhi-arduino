@@ -320,9 +320,10 @@ bool Client::toggleChat() {
     }
     switch (state_machine_.state()) {
         case State::Idle:
-            return startListening(config_.enable_server_aec
-                                      ? ListeningMode::Realtime
-                                      : ListeningMode::AutoStop);
+            return startListening(config_.enable_server_aec &&
+                                           config_.enable_voice_barge_in
+                                       ? ListeningMode::Realtime
+                                       : ListeningMode::AutoStop);
         case State::Speaking:
             return abortSpeaking(AbortReason::None);
         case State::Listening:
@@ -371,7 +372,8 @@ bool Client::wakeWordDetected(const std::string& wake_word) {
     const State current = state_machine_.state();
     pending_wake_word_ = wake_word;
     if (current == State::Idle) {
-        return startListening(config_.enable_server_aec
+        return startListening(config_.enable_server_aec &&
+                                      config_.enable_voice_barge_in
                                   ? ListeningMode::Realtime
                                   : ListeningMode::AutoStop);
     }
@@ -832,10 +834,16 @@ void Client::onTransportClose() {
     if (expected) {
         return;
     }
-    if (state_machine_.state() == State::Idle && !session_ready_ &&
+    const State state_before_close = state_machine_.state();
+    if (state_before_close == State::Idle && !session_ready_ &&
         !awaiting_hello_) {
         return;
     }
+    // The official WebSocket protocol treats an established peer close as the
+    // normal end of its audio channel. Keep a close during connect/send as an
+    // error, but do not leave the UI showing an error after a completed turn.
+    const bool report_disconnect = state_before_close == State::Connecting ||
+                                   transport_send_in_progress_;
     cancelPlayback();
     // A terminal event does not necessarily mean a custom Transport has
     // discarded every already-queued callback. close() is the explicit barrier.
@@ -847,7 +855,7 @@ void Client::onTransportClose() {
         current == State::Speaking) {
         state_machine_.transitionTo(State::Idle);
     }
-    if (!expected && !end_requested_) {
+    if (!expected && report_disconnect && !end_requested_) {
         reportError(ErrorCode::TransportDisconnected, "WebSocket connection closed");
     }
 }
@@ -1041,10 +1049,12 @@ bool Client::sendTextNow(const std::string& text) {
         handleTransportSendFailure("text transport is disconnected");
         return false;
     }
+    transport_send_in_progress_ = true;
     ++transport_call_depth_;
     const bool sent =
         transport_.sendText(reinterpret_cast<const uint8_t*>(text.data()), text.size());
     --transport_call_depth_;
+    transport_send_in_progress_ = false;
     if (!sent) {
         handleTransportSendFailure("failed to send a text message");
         return false;
@@ -1119,9 +1129,11 @@ bool Client::sendTransportBinary(const uint8_t* data, size_t size) {
         return false;
     }
     deferred_text_chain_count_ = 0;
+    transport_send_in_progress_ = true;
     ++transport_call_depth_;
     const bool sent = transport_.sendBinary(data, size);
     --transport_call_depth_;
+    transport_send_in_progress_ = false;
     if (!sent) {
         handleTransportSendFailure("failed to send an audio frame");
         return false;

@@ -135,8 +135,8 @@ bool Protocol::validateConfig(const ClientConfig& config, std::string& error) {
         error = "protocol_version must be 1, 2, or 3";
         return false;
     }
-    if (config.enable_server_aec && config.protocol_version != 2) {
-        error = "server AEC requires WebSocket protocol version 2 timestamps";
+    if (config.enable_voice_barge_in && !config.enable_server_aec) {
+        error = "voice barge-in requires server AEC";
         return false;
     }
     if (!validSampleRate(config.input_audio.sample_rate) ||
