@@ -4,8 +4,8 @@
  * Complete Xiaozhi voice terminal with TftRobotEyes expressions. It receives
  * Xiaozhi LLM emotion events, prints their typed state to Serial, and forwards
  * the exact protocol string to TftRobotEyes. A compile-time selected audio
- * profile handles microphone capture, Opus playback, WakeNet, and BOOT-button
- * chat control.
+ * preset handles microphone capture, Opus playback, and WakeNet. This sketch
+ * owns its TFT and BOOT-button configuration.
  *
  * Required libraries:
  *   - TftRobotEyes >= 1.1.0
@@ -20,11 +20,13 @@
  * wn9_nihaoxiaozhi_tts, otherwise the phrase "你好小智" cannot be detected.
  */
 
+// Change this one line to XIAOZHI_AUDIO_BOARD_NULLLAB_AI_VOX for AI VOX audio.
+#ifndef XIAOZHI_AUDIO_BOARD
+#define XIAOZHI_AUDIO_BOARD XIAOZHI_AUDIO_BOARD_OJ_ESP32S3_BASIC
+#endif
+
 #include <Arduino.h>
 #include <Xiaozhi.h>
-
-#include "../TftEsPiDisplay/BoardConfig.h"
-#include "../TftEsPiDisplay/BoardAudioConfig.h"
 
 #include <ArduinoWebsockets.h>
 #if XIAOZHI_AUDIO_ENABLE_WAKE_ESP_SR
@@ -40,8 +42,46 @@
 
 #include <cstring>
 
-// Reuse the proven, configurable audio implementation from TftEsPiDisplay.
-#include "../TftEsPiDisplay/I2sOpusAudioPort.impl.h"
+#ifndef XIAOZHI_DEVICE_BOARD_TYPE
+#define XIAOZHI_DEVICE_BOARD_TYPE "esp32s3-tft-emotion-face"
+#endif
+#ifndef XIAOZHI_DEVICE_BOARD_NAME
+#define XIAOZHI_DEVICE_BOARD_NAME "ESP32-S3 TFT Emotion Face"
+#endif
+#ifndef XIAOZHI_CHAT_BUTTON_PIN
+#define XIAOZHI_CHAT_BUTTON_PIN 0
+#endif
+#ifndef XIAOZHI_CHAT_BUTTON_ACTIVE_LEVEL
+#define XIAOZHI_CHAT_BUTTON_ACTIVE_LEVEL LOW
+#endif
+#ifndef XIAOZHI_TFT_ROTATION
+#define XIAOZHI_TFT_ROTATION 0
+#endif
+
+#ifndef XIAOZHI_ENABLE_SERVER_AEC_DEFAULT
+#define XIAOZHI_ENABLE_SERVER_AEC_DEFAULT 1
+#endif
+#ifndef XIAOZHI_ENABLE_VOICE_BARGE_IN_DEFAULT
+#define XIAOZHI_ENABLE_VOICE_BARGE_IN_DEFAULT 1
+#endif
+#if XIAOZHI_ENABLE_VOICE_BARGE_IN_DEFAULT && \
+    !XIAOZHI_ENABLE_SERVER_AEC_DEFAULT
+#error "Voice barge-in requires server AEC in this audio pipeline"
+#endif
+#ifndef XIAOZHI_PROTOCOL_VERSION_OVERRIDE
+#define XIAOZHI_PROTOCOL_VERSION_OVERRIDE 0
+#endif
+#if XIAOZHI_PROTOCOL_VERSION_OVERRIDE < 0 || \
+    XIAOZHI_PROTOCOL_VERSION_OVERRIDE > 3
+#error "XIAOZHI_PROTOCOL_VERSION_OVERRIDE must be 0, 1, 2, or 3"
+#endif
+#ifndef XIAOZHI_ALLOW_UNTIMESTAMPED_SERVER_AEC
+#define XIAOZHI_ALLOW_UNTIMESTAMPED_SERVER_AEC 0
+#endif
+#if XIAOZHI_ALLOW_UNTIMESTAMPED_SERVER_AEC != 0 && \
+    XIAOZHI_ALLOW_UNTIMESTAMPED_SERVER_AEC != 1
+#error "XIAOZHI_ALLOW_UNTIMESTAMPED_SERVER_AEC must be 0 or 1"
+#endif
 
 // Opus encoding/decoding runs on the audio codec task; keep enough room for
 // JSON and UI callbacks without reserving the former 48 KiB loop stack.
@@ -284,7 +324,7 @@ void pollDialogueTriggers() {
   }
 
   const uint32_t now = millis();
-  const bool reading = digitalRead(BOARD_CHAT_BUTTON);
+  const bool reading = digitalRead(XIAOZHI_CHAT_BUTTON_PIN);
   if (reading != chatButtonReading) {
     chatButtonReading = reading;
     chatButtonChangedMs = now;
@@ -292,7 +332,7 @@ void pollDialogueTriggers() {
   if (reading != chatButtonStableState &&
       now - chatButtonChangedMs >= kChatButtonDebounceMs) {
     chatButtonStableState = reading;
-    if (chatButtonStableState == BOARD_CHAT_BUTTON_ACTIVE_LEVEL) {
+    if (chatButtonStableState == XIAOZHI_CHAT_BUTTON_ACTIVE_LEVEL) {
       toggleDialogue("BOOT button");
     }
   }
@@ -301,11 +341,12 @@ void pollDialogueTriggers() {
 void setup() {
   Serial.begin(115200);
   delay(250);
-  pinMode(BOARD_CHAT_BUTTON, INPUT_PULLUP);
-  Serial.printf("[board] %s\n", BOARD_NAME);
+  pinMode(XIAOZHI_CHAT_BUTTON_PIN, INPUT_PULLUP);
+  Serial.printf("[audio] profile=%s\n",
+                I2sOpusAudioPort::Config::compiledProfileName());
 
   tft.init();
-  tft.setRotation(0);  // 240x240 ST7789 test-board orientation.
+  tft.setRotation(XIAOZHI_TFT_ROTATION);
   tft.fillScreen(TFT_BLACK);
 
   eyesReady = eyes.begin(50);
@@ -359,8 +400,8 @@ void setup() {
   xiaozhi::ProvisioningResult provisioning;
   std::string provisioningError;
   xiaozhi::OfficialServiceOptions serviceOptions;
-  serviceOptions.board_type = BOARD_TYPE;
-  serviceOptions.board_name = BOARD_NAME;
+  serviceOptions.board_type = XIAOZHI_DEVICE_BOARD_TYPE;
+  serviceOptions.board_name = XIAOZHI_DEVICE_BOARD_NAME;
   Serial.println("[network] fetching official Xiaozhi configuration");
   if (!xiaozhi::ArduinoOfficialService::configure(
           config, provisioning, provisioningError, serviceOptions)) {

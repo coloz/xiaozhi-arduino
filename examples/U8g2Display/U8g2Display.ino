@@ -18,8 +18,16 @@
 
 // Optional dependencies for this example only:
 //   U8g2 >= 2.36 and ArduinoWebsockets >= 0.5.4
-// Change the constructor and Wire pins to match your OLED.
-U8G2_SSD1306_128X64_NONAME_F_HW_I2C oled(U8G2_R0, U8X8_PIN_NONE);
+// Display wiring stays in this .ino. Change these two defaults for your OLED.
+#ifndef XIAOZHI_U8G2_CLOCK_PIN
+#define XIAOZHI_U8G2_CLOCK_PIN SCL
+#endif
+#ifndef XIAOZHI_U8G2_DATA_PIN
+#define XIAOZHI_U8G2_DATA_PIN SDA
+#endif
+U8G2_SSD1306_128X64_NONAME_F_SW_I2C oled(
+    U8G2_R0, XIAOZHI_U8G2_CLOCK_PIN, XIAOZHI_U8G2_DATA_PIN,
+    U8X8_PIN_NONE);
 xiaozhi::ArduinoWebSocketTransport transport;
 
 namespace {

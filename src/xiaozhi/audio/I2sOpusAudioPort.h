@@ -1,11 +1,10 @@
 #pragma once
 
-#include <Xiaozhi.h>
-
 #include <cstddef>
 #include <cstdint>
 
-#include "AudioProfile.h"
+#include "../Audio.h"
+#include "../boards/AudioProfile.h"
 
 class TwoWire;
 

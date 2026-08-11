@@ -1,18 +1,20 @@
 # 音频硬件 Profile 配置指南
 
-`TftEsPiDisplay` 使用编译期音频 Profile 选择麦克风、扬声器和 Codec 后端。它的用法类似 U8g2 的构造器：先在 `examples/TftEsPiDisplay/BoardConfig.h` 选择一个 Profile，再填写该方案需要的引脚和电气参数。没有选中的 ES8311、PDM 和 WakeNet 代码会被预处理器排除。
+`TftEsPiDisplay` 使用编译期音频板预设选择麦克风、扬声器和 Codec 配置；预设内部再选择对应的音频 Profile。屏幕、背光和按钮引脚不属于音频预设。新开发板仍可使用 Custom 预设自行填写音频引脚和电气参数。没有选中的 ES8311、PDM 和 WakeNet 代码会被预处理器排除。
 
 本文只描述当前代码已经实现的能力。官方 `xiaozhi-esp32-2.4.0` 中的 ES7210/TDM 麦克风阵列和 ES8388 等方案尚未成为本示例的内置后端，边界见“尚未内置的官方方案”。
 
 ## 快速开始
 
-1. 打开 `examples/TftEsPiDisplay/BoardConfig.h`。
-2. 将 `XIAOZHI_AUDIO_PROFILE` 改为下表中的一个值。
-3. 填写该 Profile 使用的 `BOARD_AUDIO_*` 引脚、采样率和增益。
+1. 打开目标 `.ino`，在 `#include <Xiaozhi.h>` 之前定义 `XIAOZHI_AUDIO_BOARD`。
+2. 将它设为库内已有的开发板；OpenJumper ESP32 AIOT Basic 与 NULLLAB AI VOX 一代可直接选择，不需要 `BoardConfig.h`。
+3. 新板选择 `XIAOZHI_AUDIO_BOARD_CUSTOM`，再于包含 `Xiaozhi.h` 前填写下表所需的 `BOARD_AUDIO_*` 和 `XIAOZHI_AUDIO_PROFILE` 宏。
 4. 根据是否需要本地唤醒设置 `XIAOZHI_AUDIO_ENABLE_WAKE_ESP_SR` 为数值 `0` 或 `1`。
 5. 首次烧录时按文末清单逐项验收；编译成功不等于音频硬件已经工作。
 
-未定义 `XIAOZHI_AUDIO_PROFILE` 时，`I2sOpusAudioPort.h` 为兼容旧代码会选择 ES8311；示例的 `BoardConfig.h` 也显式选择 ES8311。移植新板时建议始终显式定义，不依赖默认值。
+完整示例在 `.ino` 中默认显式选择 `XIAOZHI_AUDIO_BOARD_OJ_ESP32S3_BASIC`。直接使用 `I2sOpusAudioPort.h` 且未定义 `XIAOZHI_AUDIO_PROFILE` 时，为兼容旧代码仍会选择 ES8311。移植新板时建议显式选择 Custom 和音频 Profile，不依赖默认值。
+
+显示配置始终由应用负责：TFT_eSPI 在已安装库的 `User_Setup.h` 或构建参数中填写屏幕引脚，不在示例目录增加配置头文件；U8g2 直接在单个 `.ino` 的构造函数附近传入屏幕引脚。切换 `XIAOZHI_AUDIO_BOARD` 不会影响显示。
 
 ## Profile 与器件别名
 
@@ -54,11 +56,11 @@ Profile 会在 `I2sOpusAudioPort.h` 中派生数值为 `0` 或 `1` 的 `XIAOZHI_
 
 `library.properties` 只声明 Xiaozhi 核心依赖。使用本完整示例时，仍需根据选项安装对应的 Opus、ES8311 或 ESP-SR 组件。
 
-## BoardConfig 公共字段
+## 音频板预设公共字段
 
 `BoardAudioConfig.h::makeConfig()` 会将现有 `BOARD_AUDIO_*` 宏映射到 `I2sOpusAudioPort::Config`：
 
-| BoardConfig 宏 | 作用 |
+| 音频板宏 | 作用 |
 | --- | --- |
 | `BOARD_AUDIO_OUTPUT_I2S_PORT` | 扬声器 I2S 控制器编号 |
 | `BOARD_AUDIO_OUTPUT_SAMPLE_RATE` | 扬声器硬件采样率 |
@@ -94,7 +96,7 @@ Profile 会在 `I2sOpusAudioPort.h` 中派生数值为 `0` 或 `1` 的 `XIAOZHI_
 
 ## 配置 ES8311
 
-在 `BoardConfig.h` 中选择：
+在自定义音频板预设中选择：
 
 ```cpp
 #define XIAOZHI_AUDIO_PROFILE XIAOZHI_AUDIO_PROFILE_ES8311
@@ -155,7 +157,7 @@ ES8311 路径会在静音时把 `BOARD_AUDIO_CODEC_PA_PIN` 拉到非有效电平
 #define XIAOZHI_AUDIO_PROFILE XIAOZHI_AUDIO_PROFILE_I2S_DUPLEX
 ```
 
-在 `BoardConfig.h` 中令输入输出使用相同的：
+在自定义音频板预设中令输入输出使用相同的：
 
 - `*_I2S_PORT`
 - `*_SAMPLE_RATE`
@@ -245,7 +247,7 @@ Custom Profile 复用当前标准 I2S 管线，只把 Codec 的初始化、静�
 #define XIAOZHI_AUDIO_PROFILE XIAOZHI_AUDIO_PROFILE_CUSTOM_CODEC
 ```
 
-其默认硬件格式是共享 I2S、24 kHz、16-bit DMA、16-bit slot、双声道 `Both`。在 `BoardConfig.h` 中像 ES8311 一样填写共享 I2S 引脚，但自定义 Codec 的 I2C/SPI 控制由回调负责。
+其默认硬件格式是共享 I2S、24 kHz、16-bit DMA、16-bit slot、双声道 `Both`。在自定义音频板预设中像 ES8311 一样填写共享 I2S 引脚，但自定义 Codec 的 I2C/SPI 控制由回调负责。
 
 三个回调必须全部提供：
 
@@ -318,7 +320,7 @@ input.rightShift = 12;
 
 `validBits=24` 不会自动计算或替代 `rightShift`；采集转换实际使用 `rightShift`。不同模块、批次和 Arduino I2S 驱动对有效位的对齐可能不同。默认 12 是兼容官方实现的起点：波形削顶时增大该值，电平过低时减小，并同时观察原始 RMS、峰值和噪声底，不能只凭“24 位”猜测。
 
-这些常用格式可以直接在 `BoardConfig.h` 调整：
+这些常用格式可以直接在自定义音频板预设中调整：
 
 ```cpp
 #define BOARD_AUDIO_INPUT_DATA_BITS 32
@@ -337,7 +339,7 @@ input.rightShift = 12;
 // 或 CaptureChannel::Auto，让运行时按左右声道能量选择。
 ```
 
-`BoardConfig.h` 默认把 `captureChannel` 设为 `Left`。共享 I2S Profile 只允许 RX/TX 的 slot mask、输入有效位和输入右移量不同；数据/slot 位宽、channel mode、采样率和公共时钟必须一致。独立 Profile 才能分别设置位宽、channel mode 和采样率。
+开发板默认配置把 `captureChannel` 设为 `Left`。共享 I2S Profile 只允许 RX/TX 的 slot mask、输入有效位和输入右移量不同；数据/slot 位宽、channel mode、采样率和公共时钟必须一致。独立 Profile 才能分别设置位宽、channel mode 和采样率。
 
 输出为 32-bit DMA 时，管线会把 PCM16 固定左移 16 位，放入 32-bit 字的最高有效位；无 Codec 方案的软件音量也在这一输出路径中生效。
 
@@ -373,7 +375,7 @@ input.rightShift = 12;
 - 所有硬件输入和输出采样率必须大于 0 且能被 100 整除，以保证支持的 10/20/40/60 ms 音频帧映射为整数样本数。
 - 标准 I2S 的 BCLK、WS 和 DATA 必须为有效 GPIO；MCLK 一般可以为 `-1`，但 ES8311 的 `useMclk=true` 时不能省略。
 - ES8311 和共享 I2S 必须同 port、同采样率、同公共时钟及格式。
-- 独立模式默认使用 port 0 输出、port 1 输入；PDM 默认 port 0 输入、port 1 输出。实际端口可由 BoardConfig 修改，但必须存在且不同。
+- 独立模式默认使用 port 0 输出、port 1 输入；PDM 默认 port 0 输入、port 1 输出。实际端口可由音频板预设修改，但必须存在且不同。
 - 当前标准 I2S 后端使用 Philips 格式，只实现 16/32-bit DMA、1/2 声道及 Left/Right/Both slot。
 - 单声道端点可选择 Left、Right 或由 I2S 硬件复制到 Both；双声道端点必须选择 Both。16-bit 输入必须声明 16 个有效位且不能再配置 `rightShift`；输出有效位固定为 16。
 - Profile 只负责软件能力选择，不检查 GPIO 是否与 Flash/PSRAM、USB、启动绑带、显示或 SD 卡冲突。

@@ -1,7 +1,12 @@
 #pragma once
 
-#include "BoardConfig.h"
+// Maps the selected library-owned audio-board preset into runtime audio data.
+#include "../boards/BoardPresets.h"
 #include "I2sOpusAudioPort.h"
+
+#ifndef XIAOZHI_AUDIO_BOARD
+#error "Define XIAOZHI_AUDIO_BOARD before including Xiaozhi.h"
+#endif
 
 #if XIAOZHI_AUDIO_ENABLE_CODEC_ES8311
 #include <Wire.h>

@@ -2,16 +2,23 @@
  * TftEsPiDisplay 示例
  *
  * 演示由 TFT_eSPI 状态界面、服务配置、I2S 音频及 Opus 编解码组成的完整
- * 语音对话流程。示例不绑定开发板厂家；移植时请修改 BoardConfig.h，并可
- * 通过 I2sOpusAudioPort::Config 调整音频参数或接入其他 Codec。
+ * 语音对话流程。示例通过 .ino 开头的宏选择库内音频预设。TFT_eSPI 不支持
+ * 构造函数传入引脚，烧录前请在 TFT_eSPI 自身配置或构建参数中设置显示硬件。
  */
 
+// Change this one line to XIAOZHI_AUDIO_BOARD_NULLLAB_AI_VOX for AI VOX audio.
+#ifndef XIAOZHI_AUDIO_BOARD
+#define XIAOZHI_AUDIO_BOARD XIAOZHI_AUDIO_BOARD_OJ_ESP32S3_BASIC
+#endif
+
+// Edit the Wi-Fi credentials directly in this sketch.
+#define XIAOZHI_WIFI_SSID "vivoX300"
+#define XIAOZHI_WIFI_PASSWORD "1234567890"
+
 #include <Arduino.h>
+#include <Xiaozhi.h>
 
-#include "BoardConfig.h"
-#include "BoardAudioConfig.h"
-
-#include <TFT_eSPI.h>  // Uses the sketch-local User_Setup.h for this board.
+#include <TFT_eSPI.h>  // Configure the installed library for your display first.
 #include <WiFi.h>
 #include <ArduinoWebsockets.h>  // Makes the optional transport dependency explicit.
 #if XIAOZHI_AUDIO_ENABLE_WAKE_ESP_SR
@@ -22,14 +29,6 @@
 #include <EspressifEs8311.h>    // Audio dependencies used by the implementation.
 #endif
 #include <EspressifOpus.h>
-#include <Xiaozhi.h>
-
-#if __has_include("Secrets.h")
-#include "Secrets.h"
-#endif
-// Keep the optional audio implementation in this sketch translation unit.
-// The .impl.h suffix prevents Arduino builders from compiling it a second time.
-#include "I2sOpusAudioPort.impl.h"
 
 // Protocol/UI callbacks need more than Arduino's default 8 KiB. Opus now runs
 // on its dedicated codec task, so the loop no longer needs a 48 KiB stack.
@@ -37,8 +36,8 @@ SET_LOOP_TASK_STACK_SIZE(16 * 1024);
 
 // Optional dependencies for this example only:
 //   TFT_eSPI >= 2.5 and ArduinoWebsockets >= 0.5.4
-// Display and audio wiring lives in BoardConfig.h. Most audio behavior can be
-// changed through I2sOpusAudioPort::Config without editing its implementation.
+// XIAOZHI_AUDIO_BOARD selects only microphone/speaker wiring. Display and UI
+// GPIO remain application-owned.
 TFT_eSPI tft;
 xiaozhi::ArduinoWebSocketTransport transport;
 
@@ -47,12 +46,53 @@ const I2sOpusAudioPort::Config audioConfig =
 I2sOpusAudioPort audioPort(audioConfig);
 
 namespace {
-#ifndef XIAOZHI_WIFI_SSID
-#define XIAOZHI_WIFI_SSID "YOUR_WIFI_SSID"
+#ifndef XIAOZHI_DEVICE_BOARD_TYPE
+#define XIAOZHI_DEVICE_BOARD_TYPE "esp32s3-tft-espi"
 #endif
-#ifndef XIAOZHI_WIFI_PASSWORD
-#define XIAOZHI_WIFI_PASSWORD "YOUR_WIFI_PASSWORD"
+#ifndef XIAOZHI_DEVICE_BOARD_NAME
+#define XIAOZHI_DEVICE_BOARD_NAME "ESP32-S3 TFT Xiaozhi"
 #endif
+#ifndef XIAOZHI_CHAT_BUTTON_PIN
+#define XIAOZHI_CHAT_BUTTON_PIN 0
+#endif
+#ifndef XIAOZHI_CHAT_BUTTON_ACTIVE_LEVEL
+#define XIAOZHI_CHAT_BUTTON_ACTIVE_LEVEL LOW
+#endif
+#ifndef XIAOZHI_TFT_ROTATION
+#define XIAOZHI_TFT_ROTATION 1
+#endif
+#ifndef XIAOZHI_TFT_BACKLIGHT_PIN
+#define XIAOZHI_TFT_BACKLIGHT_PIN -1
+#endif
+#ifndef XIAOZHI_TFT_BACKLIGHT_ACTIVE_LEVEL
+#define XIAOZHI_TFT_BACKLIGHT_ACTIVE_LEVEL HIGH
+#endif
+
+#ifndef XIAOZHI_ENABLE_SERVER_AEC_DEFAULT
+#define XIAOZHI_ENABLE_SERVER_AEC_DEFAULT 1
+#endif
+#ifndef XIAOZHI_ENABLE_VOICE_BARGE_IN_DEFAULT
+#define XIAOZHI_ENABLE_VOICE_BARGE_IN_DEFAULT 1
+#endif
+#if XIAOZHI_ENABLE_VOICE_BARGE_IN_DEFAULT && \
+    !XIAOZHI_ENABLE_SERVER_AEC_DEFAULT
+#error "Voice barge-in requires server AEC in this audio pipeline"
+#endif
+#ifndef XIAOZHI_PROTOCOL_VERSION_OVERRIDE
+#define XIAOZHI_PROTOCOL_VERSION_OVERRIDE 0
+#endif
+#if XIAOZHI_PROTOCOL_VERSION_OVERRIDE < 0 || \
+    XIAOZHI_PROTOCOL_VERSION_OVERRIDE > 3
+#error "XIAOZHI_PROTOCOL_VERSION_OVERRIDE must be 0, 1, 2, or 3"
+#endif
+#ifndef XIAOZHI_ALLOW_UNTIMESTAMPED_SERVER_AEC
+#define XIAOZHI_ALLOW_UNTIMESTAMPED_SERVER_AEC 0
+#endif
+#if XIAOZHI_ALLOW_UNTIMESTAMPED_SERVER_AEC != 0 && \
+    XIAOZHI_ALLOW_UNTIMESTAMPED_SERVER_AEC != 1
+#error "XIAOZHI_ALLOW_UNTIMESTAMPED_SERVER_AEC must be 0 or 1"
+#endif
+
 constexpr char kWifiSsid[] = XIAOZHI_WIFI_SSID;
 constexpr char kWifiPassword[] = XIAOZHI_WIFI_PASSWORD;
 
@@ -186,8 +226,8 @@ std::string buildSystemInfoJson(const std::string& deviceId,
   application["elf_sha256"] = "";
   document["partition_table"].to<JsonArray>();
   document["ota"]["label"] = "app";
-  document["board"]["type"] = BOARD_TYPE;
-  document["board"]["name"] = BOARD_NAME;
+  document["board"]["type"] = XIAOZHI_DEVICE_BOARD_TYPE;
+  document["board"]["name"] = XIAOZHI_DEVICE_BOARD_NAME;
 
   std::string output;
   serializeJson(document, output);
@@ -206,7 +246,7 @@ bool fetchOfficialConfiguration(const std::string& deviceId,
   request.url = kProvisioningUrl;
   request.device_id = deviceId;
   request.client_id = clientId;
-  request.user_agent = BOARD_TYPE "/2.4.0";
+  request.user_agent = XIAOZHI_DEVICE_BOARD_TYPE "/2.4.0";
   request.language = "zh-CN";
   request.body_json = buildSystemInfoJson(deviceId, clientId);
   request.activation_version = 1;
@@ -312,7 +352,7 @@ void pollDialogueTriggers() {
   }
 
   const uint32_t now = millis();
-  const bool reading = digitalRead(BOARD_CHAT_BUTTON);
+  const bool reading = digitalRead(XIAOZHI_CHAT_BUTTON_PIN);
   if (reading != chatButtonReading) {
     chatButtonReading = reading;
     chatButtonChangedMs = now;
@@ -320,7 +360,7 @@ void pollDialogueTriggers() {
   if (reading != chatButtonStableState &&
       now - chatButtonChangedMs >= kChatButtonDebounceMs) {
     chatButtonStableState = reading;
-    if (chatButtonStableState == BOARD_CHAT_BUTTON_ACTIVE_LEVEL) {
+    if (chatButtonStableState == XIAOZHI_CHAT_BUTTON_ACTIVE_LEVEL) {
       toggleDialogue("BOOT button");
     }
   }
@@ -329,14 +369,14 @@ void pollDialogueTriggers() {
 void setup() {
   Serial.begin(115200);
   delay(250);
-  pinMode(BOARD_CHAT_BUTTON, INPUT_PULLUP);
-  Serial.printf("[board] %s\n", BOARD_NAME);
-  Serial.printf("[display] ST7789 %dx%d, SCLK=%d MOSI=%d DC=%d CS=%d\n",
-                BOARD_LCD_WIDTH, BOARD_LCD_HEIGHT, BOARD_LCD_SCLK,
-                BOARD_LCD_MOSI, BOARD_LCD_DC, BOARD_LCD_CS);
-
+  pinMode(XIAOZHI_CHAT_BUTTON_PIN, INPUT_PULLUP);
+#if XIAOZHI_TFT_BACKLIGHT_PIN >= 0
+  pinMode(XIAOZHI_TFT_BACKLIGHT_PIN, OUTPUT);
+  digitalWrite(XIAOZHI_TFT_BACKLIGHT_PIN,
+               XIAOZHI_TFT_BACKLIGHT_ACTIVE_LEVEL);
+#endif
   tft.init();
-  tft.setRotation(BOARD_LCD_ROTATION);
+  tft.setRotation(XIAOZHI_TFT_ROTATION);
   redraw();
   Serial.printf("[display] initialized: %dx%d\n", tft.width(), tft.height());
 
@@ -407,8 +447,8 @@ void setup() {
   // provisioning service. Uncomment and edit the override only for a compatible
   // custom provisioning service.
   xiaozhi::OfficialServiceOptions serviceOptions;
-  serviceOptions.board_type = BOARD_TYPE;
-  serviceOptions.board_name = BOARD_NAME;
+  serviceOptions.board_type = XIAOZHI_DEVICE_BOARD_TYPE;
+  serviceOptions.board_name = XIAOZHI_DEVICE_BOARD_NAME;
   /*
   serviceOptions.provisioning_url = "https://your-server.example/xiaozhi/ota/";
   */

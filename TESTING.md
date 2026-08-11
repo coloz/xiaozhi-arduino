@@ -79,9 +79,9 @@ WebSocket 分支时将 `_WS_CONFIG_MAX_MESSAGE_SIZE=16384` 同时传给依赖库
 
 ### 编译期音频 Profile
 
-发布前至少为 ESP32-S3 分别构建以下组合；Profile 宏必须通过
-`build.extra_flags` 或在 `BoardConfig.h` 中定义，并且出现在
-`I2sOpusAudioPort.h` 之前：
+发布前至少为 ESP32-S3 分别构建以下组合；可在 `.ino` 中通过
+`XIAOZHI_AUDIO_BOARD` 选择库内音频预设，也可在
+`I2sOpusAudioPort.h` 之前直接定义 Profile 宏：
 
 - `XIAOZHI_AUDIO_PROFILE_ES8311` + `XIAOZHI_AUDIO_ENABLE_WAKE_ESP_SR=1`；
 - `XIAOZHI_AUDIO_PROFILE_I2S_DUPLEX` + WakeNet 关闭；

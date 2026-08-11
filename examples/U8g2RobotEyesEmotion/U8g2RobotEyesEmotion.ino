@@ -33,7 +33,16 @@
 #define XIAOZHI_WIFI_PASSWORD "YOUR_WIFI_PASSWORD"
 #endif
 
-U8G2_SSD1306_128X64_NONAME_F_HW_I2C display(U8G2_R0, U8X8_PIN_NONE);
+// Display wiring stays in this .ino. Change these two defaults for your OLED.
+#ifndef XIAOZHI_U8G2_CLOCK_PIN
+#define XIAOZHI_U8G2_CLOCK_PIN SCL
+#endif
+#ifndef XIAOZHI_U8G2_DATA_PIN
+#define XIAOZHI_U8G2_DATA_PIN SDA
+#endif
+U8G2_SSD1306_128X64_NONAME_F_SW_I2C display(
+    U8G2_R0, XIAOZHI_U8G2_CLOCK_PIN, XIAOZHI_U8G2_DATA_PIN,
+    U8X8_PIN_NONE);
 U8g2RobotEyes eyes(display);
 xiaozhi::ArduinoWebSocketTransport transport;
 

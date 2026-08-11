@@ -1,3 +1,5 @@
+#pragma once
+
 #include "I2sOpusAudioPort.h"
 
 #include <Arduino.h>

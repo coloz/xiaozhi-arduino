@@ -8,9 +8,11 @@
 - ESP32-S3，16 MB Flash，8 MB OPI PSRAM
 - 分区：`ESP SR 16M`（`PartitionScheme=esp_sr_16`）
 - USB CDC On Boot：Enabled，便于查看串口诊断
-- 音频 Profile 与接线沿用 `../TftEsPiDisplay/BoardConfig.h`；完整选择方法见
-  项目根目录的 `AUDIO_PROFILES.md`
-- TFT_eSPI 仍使用本机已经验证可工作的显示配置
+- 开发板音频接线由 `.ino` 开头的 `XIAOZHI_AUDIO_BOARD` 直接选择，不需要
+  `BoardConfig.h`；完整选择方法见项目根目录的
+  `AUDIO_PROFILES.md`
+- TFT_eSPI 不支持构造函数传入引脚；请在已安装库的 `User_Setup.h` 或构建
+  参数中配置显示控制器和引脚，本示例不再携带额外的显示配置头文件
 
 `models/srmodels.bin` 只包含 Espressif ESP-SR 2.4.6 的
 `wn9_nihaoxiaozhi_tts` 模型，不含 Arduino 核心默认的 `wn9_hiesp`。

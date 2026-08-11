@@ -25,7 +25,7 @@ Rather than copying the entire original ESP-IDF project into Arduino, it retains
 | ESP32 MAC address, persistent UUID, and firmware version | Fonts, emoji, OGG files, and asset partitions |
 | Injectable `Transport` / `EncodedAudioPort` | MQTT+UDP transport extensions |
 
-Arduino recursively compiles every source file under a library's `src/` directory, so optional modules cannot avoid their dependencies merely by remaining unused. The core `src/` therefore remains free of optional audio-hardware, Opus, and ESP-SR dependencies. The core still uses Opus as its wire format without forcing a particular Opus or I2S library; the complete examples include the selected audio implementation in the sketch translation unit through a compile-time profile.
+Arduino recursively compiles `.cpp` files under a library's `src/` directory, so the optional audio implementation is stored as opt-in headers under `src/xiaozhi/audio`. A normal application that does not define `XIAOZHI_AUDIO_BOARD` pulls in no Opus, codec, or ESP-SR dependency. Once selected, `Xiaozhi.h` includes that audio implementation in the sketch translation unit.
 
 ## Installation
 
@@ -46,11 +46,11 @@ Display libraries are not core dependencies. Install them separately as needed a
 
 - `examples/U8g2Display`: U8g2 2.36+ for monochrome OLED displays.
 - `examples/U8g2RobotEyesEmotion`: U8g2RobotEyes 1.3+ and U8g2 2.36+; displays the server's exact emotion strings as 128x64 Xiaozhi eyes.
-- `examples/TftEsPiDisplay`: TFT_eSPI 2.5+; configure its `User_Setup`, then copy `Secrets.example.h` to the Git-ignored `Secrets.h` and fill in Wi-Fi before flashing.
+- `examples/TftEsPiDisplay`: TFT_eSPI 2.5+; configure its `User_Setup`, then edit Wi-Fi directly at the top of the `.ino` before flashing.
 - `examples/TftEmotionFace`: TftRobotEyes 1.1+ and TFT_eSPI 2.5+; displays the server's exact emotion strings as full-color animated eyes and prints serial state with stable enum values.
 - `examples/LvglDisplay`: LVGL 9.x + TFT_eSPI 2.5+; LVGL manages widgets, while TFT_eSPI only flushes pixels to the display. The example includes a minimal `lv_conf.h`, so a clean installation does not require changes to the LVGL library directory. This configuration enables only the Label widget used by the example and disables themes, complex drawing, Flex, and Grid. Enable additional features as needed for other widgets, rounded corners, or shadows, and keep an eye on the remaining space in the default application partition.
 
-All five display examples demonstrate UI integration, but they do not have identical scope. `U8g2Display`, `U8g2RobotEyesEmotion`, and `LvglDisplay` are display-only integrations without audio. `TftEsPiDisplay` and `TftEmotionFace` are complete voice terminals with microphone capture, Opus encoding/decoding, and speaker playback. All display headers and these optional audio dependencies remain on the example side and do not become dependencies of the core `src/`. Their default fonts cover ASCII only. To display Chinese STT/TTS text, choose a font with the required Chinese glyphs in the corresponding display library.
+All five display examples demonstrate UI integration, but they do not have identical scope. `U8g2Display`, `U8g2RobotEyesEmotion`, and `LvglDisplay` are display-only integrations without audio. `TftEsPiDisplay` and `TftEmotionFace` are complete voice terminals with microphone capture, Opus encoding/decoding, and speaker playback. Display headers remain on the example side; the optional audio implementation lives under `src/xiaozhi/audio` and is included only when an audio board is selected. Their default fonts cover ASCII only. To display Chinese STT/TTS text, choose a font with the required Chinese glyphs in the corresponding display library.
 
 The two complete voice examples select their hardware path through a compile-time audio profile, so only the chosen backend is compiled:
 
@@ -61,6 +61,39 @@ The two complete voice examples select their hardware path through a compile-tim
 - an application-provided custom codec.
 
 See [AUDIO_PROFILES.md](AUDIO_PROFILES.md) for profile selection, required pins, and hardware constraints. The display layer in all five examples still receives states and events only through `Callbacks`; no display header is included under this library's `src/`. A project without a display therefore needs none of the display libraries above.
+
+## Audio Board Presets
+
+Microphone, speaker, codec, I2S, and audio-I2C settings for common boards live
+under `src/xiaozhi/boards`. Select one value at the top of the `.ino`, before
+including `Xiaozhi.h`; no `BoardConfig.h` or copied audio pin list is required:
+
+```cpp
+#define XIAOZHI_AUDIO_BOARD XIAOZHI_AUDIO_BOARD_NULLLAB_AI_VOX
+#include <Xiaozhi.h>
+```
+
+The same selection can be supplied as a build flag, for example
+`-DXIAOZHI_AUDIO_BOARD=XIAOZHI_AUDIO_BOARD_NULLLAB_AI_VOX`. Built-in presets are:
+
+| Selection | Board | Audio hardware |
+| --- | --- | --- |
+| `XIAOZHI_AUDIO_BOARD_OJ_ESP32S3_BASIC` | OpenJumper ESP32 AIOT Basic (`oj_esp32s3basic`) | ES8311 on shared full-duplex I2S |
+| `XIAOZHI_AUDIO_BOARD_NULLLAB_AI_VOX` | first-generation NULLLAB AI VOX | SPH0645 microphone plus an independent I2S amplifier |
+
+The complete examples explicitly default to
+`XIAOZHI_AUDIO_BOARD_OJ_ESP32S3_BASIC`. The AI VOX preset follows the `ai_vox`
+repository's `examples/ai_vox_board`; it is not the pin-incompatible AI-VOX3.
+
+Audio presets define no display, backlight, or button pins. TFT_eSPI cannot
+accept pins in its constructor, so configure the installed library's
+`User_Setup.h` or its build flags; the examples no longer carry a display setup
+header. U8g2 clock and data pins stay beside the constructor in the single
+`.ino`. Changing an audio preset never changes the display configuration.
+
+For a new audio board, select `XIAOZHI_AUDIO_BOARD_CUSTOM` and define the
+required `BOARD_AUDIO_*` and `XIAOZHI_AUDIO_PROFILE` macros before including
+`xiaozhi/boards/BoardPresets.h`.
 
 ## Emotion Events
 
@@ -168,7 +201,7 @@ The complete `TftEsPiDisplay` audio example runs I2S capture, Opus codec work, a
 
 For compatibility with 2.4.0, `protocol_version` defaults to 1. Core `ClientConfig` requests server AEC and voice barge-in by default, but the complete TFT examples enter `Realtime` only when provisioning actually selects protocol v2, whose uplink frames carry played-downlink timestamps. Hardware testing showed that the official v1 endpoint mistakes speaker echo for barge-in and stops replies after a few syllables, so v1/v3 automatically use `AutoStop`. Button, serial, and `abortSpeaking()` interruption remain available.
 
-The complete TFT examples expose compile-time switches in `BoardConfig.h`:
+The complete TFT examples expose compile-time switches directly in the `.ino`:
 
 ```cpp
 #define XIAOZHI_ENABLE_SERVER_AEC_DEFAULT 1

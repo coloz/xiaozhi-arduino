@@ -32,14 +32,14 @@ config.client_id = xiaozhi::Esp32Identity::persistentClientId();
 
 ### 音频配置
 
-`TftEsPiDisplay` 和 `TftEmotionFace` 现在使用编译期音频 Profile，只把选中的麦克风、扬声器和 Codec 后端编译进示例固件。可选项包括 ES8311、共享时钟 I2S、独立 I2S（如 INMP441/MSM261 + MAX98357A）、PDM + MAX98357A 以及自定义 Codec；选择方法和硬件约束见 [AUDIO_PROFILES.md](AUDIO_PROFILES.md)。这些实现和依赖仍位于示例侧，不会进入核心 `src/`。
+`TftEsPiDisplay` 和 `TftEmotionFace` 现在使用编译期音频 Profile，只把选中的麦克风、扬声器和 Codec 后端编译进固件。可选项包括 ES8311、共享时钟 I2S、独立 I2S（如 INMP441/MSM261 + MAX98357A）、PDM + MAX98357A 以及自定义 Codec；选择方法和硬件约束见 [AUDIO_PROFILES.md](AUDIO_PROFILES.md)。实现位于 `src/xiaozhi/audio` 的按需包含头文件中，未定义 `XIAOZHI_AUDIO_BOARD` 时不会引入这些依赖。
 
-已有 sketch 直接填写 `I2sOpusAudioPort::Config` 的平坦字段仍保持源码兼容。新代码应先使用 `I2sOpusAudioPort::Config::forCompiledProfile()` 取得所选 Profile 的安全默认值，再填写对应端点；完整示例则通过 `BoardAudioConfig.h` 的 `xiaozhi_audio_board::makeConfig()` 将 `BoardConfig.h` 引脚转换为该配置。这样运行时调优仍可保留，同时未选中的后端在预处理阶段就被裁掉。
+已有 sketch 直接填写 `I2sOpusAudioPort::Config` 的平坦字段仍保持源码兼容。新代码应先使用 `I2sOpusAudioPort::Config::forCompiledProfile()` 取得所选 Profile 的安全默认值，再填写对应端点；完整示例则通过 `.ino` 中的 `XIAOZHI_AUDIO_BOARD` 选择库内音频预设，由 `BoardAudioConfig.h` 的 `xiaozhi_audio_board::makeConfig()` 将 `BOARD_AUDIO_*` 宏转换为该配置。这样运行时调优仍可保留，同时未选中的后端在预处理阶段就被裁掉。
 
 ## 行为差异
 
 - Arduino 的 `setup()/loop()` 取代 `app_main()` 和 Application 主任务。
-- 不再自动选择板型、引脚、显示或音频设备；由 sketch 显式选择编译期音频 Profile，并通过 `BoardAudioConfig.h` 或自定义配置注入引脚。
+- 不再自动选择显示设备或 UI 引脚；由 sketch 显式选择编译期音频板/Profile，并通过 `BoardAudioConfig.h` 或自定义配置注入音频引脚。TFT_eSPI/U8g2 的屏幕引脚仍由应用配置。
 - 不再自动接受不校验证书的 WSS；内置适配器必须配置可信 CA。
 - 原工程的重启、OTA 等 `user_only` MCP 工具不再仅靠“列表隐藏”保护；迁移后必须提供本地授权回调。
 - WebSocket 是内置参考传输。Provisioning 仍会解析 MQTT 配置，供独立 MQTT+UDP 传输扩展消费。
