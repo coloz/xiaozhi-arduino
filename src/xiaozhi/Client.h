@@ -52,6 +52,12 @@ public:
     // must follow the same single-task rule as the other Client APIs.
     bool playbackIdle() const;
     bool setPlaybackMuted(bool muted);
+    // Milliseconds until protocol timeout work is due. UINT32_MAX means there
+    // is no handshake/channel deadline. Runtime owner-task use only.
+    uint32_t nextProtocolDeadlineMs() const;
+    // True when a legacy synchronous transport or audio port still requires
+    // Client::loop() polling in the absence of notifications.
+    bool pollingRequired() const;
 
     McpServer& mcp() { return mcp_server_; }
     const McpServer& mcp() const { return mcp_server_; }
@@ -62,6 +68,7 @@ public:
     // Runtime uses this to wake its owner task when asynchronous RX arrives.
     // Configure it only before begin() and clear it after end().
     bool setTransportEventNotifier(TransportEventNotifier notifier);
+    bool setAudioEventNotifier(AudioEventNotifier notifier);
 
 private:
     enum class DeferredTextRequirement : uint8_t {

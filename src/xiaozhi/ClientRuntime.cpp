@@ -193,6 +193,7 @@ public:
             return true;
         }
         stop_requested_.store(true);
+        notifyServiceTask(false);
         if (stopped_signal_ == nullptr ||
             xSemaphoreTake(stopped_signal_, timeoutTicks(timeout_ms)) != pdTRUE) {
             return false;
@@ -234,7 +235,7 @@ public:
     }
 
     bool requestStopListening() {
-        return publishUrgentControl(kUrgentStopListening);
+        return publishUrgentControl(kUrgentStopListening, false);
     }
 
     bool requestToggleChat() {
@@ -245,7 +246,7 @@ public:
 
     bool requestAbortSpeaking(AbortReason reason) {
         pending_abort_reason_.store(static_cast<uint8_t>(reason));
-        return publishUrgentControl(kUrgentAbortSpeaking);
+        return publishUrgentControl(kUrgentAbortSpeaking, false);
     }
 
     bool requestWakeWordDetected(const std::string& wake_word) {
@@ -258,16 +259,16 @@ public:
 
     bool requestPlaybackMute(bool muted) {
         pending_playback_mute_.store(muted);
-        return publishUrgentControl(kUrgentPlaybackMute);
+        return publishUrgentControl(kUrgentPlaybackMute, false);
     }
 
     bool requestStopListeningFromISR() {
-        return publishUrgentControl(kUrgentStopListening);
+        return publishUrgentControl(kUrgentStopListening, true);
     }
 
     bool requestAbortSpeakingFromISR(AbortReason reason) {
         pending_abort_reason_.store(static_cast<uint8_t>(reason));
-        return publishUrgentControl(kUrgentAbortSpeaking);
+        return publishUrgentControl(kUrgentAbortSpeaking, true);
     }
 
     bool requestWakeWordDetectedFromISR(const char* wake_word, size_t size) {
@@ -276,7 +277,7 @@ public:
 
     bool requestPlaybackMuteFromISR(bool muted) {
         pending_playback_mute_.store(muted);
-        return publishUrgentControl(kUrgentPlaybackMute);
+        return publishUrgentControl(kUrgentPlaybackMute, true);
     }
 
     bool requestCloseSession() {
@@ -330,9 +331,6 @@ public:
                                                 &higher_priority_task_woken);
                 coalesced = queued == pdTRUE;
             }
-            if (higher_priority_task_woken == pdTRUE) {
-                portYIELD_FROM_ISR();
-            }
         } else {
             queued = xQueueSend(wake_event_queue_, &event, 0);
             if (queued != pdTRUE) {
@@ -353,6 +351,7 @@ public:
             ++wake_events_queued_;
             ++urgent_controls_queued_;
         }
+        notifyServiceTask(from_isr);
         return true;
     }
 
@@ -418,7 +417,6 @@ private:
         ToggleChat,
         CloseSession,
         SendMcp,
-        TransportReady,
     };
 
     struct Command {
@@ -516,6 +514,7 @@ private:
     FixedSlotPool<ErrorCallbackSlot> error_callback_pool_;
     std::string wake_word_scratch_;
     std::atomic<bool> task_active_{false};
+    std::atomic<TaskHandle_t> service_task_handle_{nullptr};
     std::atomic<bool> running_{false};
     std::atomic<bool> ready_{false};
     std::atomic<bool> session_ready_{false};
@@ -575,12 +574,14 @@ private:
     uint32_t last_downlink_audio_ms_ = 0;
     bool playback_watchdog_armed_ = false;
     bool received_downlink_audio_ = false;
+    uint32_t playback_retry_started_ms_ = 0;
+    bool playback_retry_pending_ = false;
 
     static constexpr uint32_t kUrgentAbortSpeaking = 1U << 0;
     static constexpr uint32_t kUrgentStopListening = 1U << 1;
     static constexpr uint32_t kUrgentPlaybackMute = 1U << 2;
 
-    bool publishUrgentControl(uint32_t control) {
+    bool publishUrgentControl(uint32_t control, bool from_isr) {
         if (!running_.load() || stop_requested_.load()) {
             ++urgent_controls_rejected_;
             return false;
@@ -592,6 +593,7 @@ private:
         } else {
             ++urgent_controls_queued_;
         }
+        notifyServiceTask(from_isr);
         return true;
     }
 
@@ -600,18 +602,28 @@ private:
     }
 
     static void transportEventReady(void* context) {
-        static_cast<Impl*>(context)->notifyTransportReady();
+        static_cast<Impl*>(context)->notifyServiceTask(false);
     }
 
-    void notifyTransportReady() {
-        if (command_queue_ == nullptr || stop_requested_.load()) {
+    static void audioEventReady(void* context) {
+        static_cast<Impl*>(context)->notifyServiceTask(false);
+    }
+
+    void notifyServiceTask(bool from_isr) {
+        TaskHandle_t task =
+            service_task_handle_.load(std::memory_order_acquire);
+        if (task == nullptr) {
             return;
         }
-        Command command;
-        command.type = CommandType::TransportReady;
-        // If the queue is full, another command has already made the Runtime
-        // runnable and its normal Client::loop() pass will drain transport RX.
-        xQueueSend(command_queue_, &command, 0);
+        if (from_isr) {
+            BaseType_t higher_priority_task_woken = pdFALSE;
+            vTaskNotifyGiveFromISR(task, &higher_priority_task_woken);
+            if (higher_priority_task_woken == pdTRUE) {
+                portYIELD_FROM_ISR();
+            }
+            return;
+        }
+        xTaskNotifyGive(task);
     }
 
     bool validConfig(const ClientRuntimeConfig& config) const {
@@ -872,6 +884,7 @@ private:
             last_downlink_audio_ms_ = 0;
             received_downlink_audio_ = false;
             playback_watchdog_armed_ = true;
+            playback_retry_pending_ = false;
             refreshPlaybackSnapshot();
             return;
         }
@@ -880,6 +893,7 @@ private:
         speaking_started_ms_ = 0;
         first_downlink_audio_ms_ = 0;
         last_downlink_audio_ms_ = 0;
+        playback_retry_pending_ = false;
         refreshPlaybackSnapshot();
     }
 
@@ -894,6 +908,7 @@ private:
             received_downlink_audio_ = true;
         }
         last_downlink_audio_ms_ = now_ms;
+        playback_retry_pending_ = false;
     }
 
     void refreshPlaybackSnapshot() {
@@ -916,10 +931,12 @@ private:
         if (now_ms - reference_ms < timeout_ms) {
             return;
         }
-        // Sampling is deferred until the deadline so the normal 2 ms service
-        // loop does not contend with audio workers on every cycle.
+        // Sampling is deferred until the deadline so notification-driven
+        // service does not contend with audio workers on every event.
         refreshPlaybackSnapshot();
         if (!playback_idle_.load()) {
+            playback_retry_started_ms_ = now_ms;
+            playback_retry_pending_ = true;
             return;
         }
 
@@ -937,14 +954,58 @@ private:
         snapshotClient();
     }
 
+    uint32_t nextPlaybackDeadlineMs() const {
+        if (!runtime_config_.playback_watchdog.enabled ||
+            !playback_watchdog_armed_ || client_.state() != State::Speaking) {
+            return std::numeric_limits<uint32_t>::max();
+        }
+        const uint32_t now_ms = runtimeNowMs();
+        const uint32_t reference_ms = received_downlink_audio_
+                                          ? last_downlink_audio_ms_
+                                          : speaking_started_ms_;
+        const uint32_t timeout_ms =
+            received_downlink_audio_
+                ? runtime_config_.playback_watchdog.inter_packet_timeout_ms
+                : runtime_config_.playback_watchdog.first_audio_timeout_ms;
+        const uint32_t elapsed_ms = now_ms - reference_ms;
+        if (elapsed_ms < timeout_ms) {
+            return timeout_ms - elapsed_ms;
+        }
+        if (!playback_retry_pending_) {
+            return 0;
+        }
+        const uint32_t retry_elapsed_ms = now_ms - playback_retry_started_ms_;
+        return retry_elapsed_ms >= runtime_config_.idle_poll_interval_ms
+                   ? 0
+                   : runtime_config_.idle_poll_interval_ms - retry_elapsed_ms;
+    }
+
+    uint32_t nextServiceDelayMs() const {
+        uint32_t delay_ms = client_.nextProtocolDeadlineMs();
+        delay_ms = std::min(delay_ms, nextPlaybackDeadlineMs());
+        if (client_.pollingRequired()) {
+            delay_ms = std::min<uint32_t>(delay_ms,
+                                          runtime_config_.poll_interval_ms);
+        }
+        return delay_ms;
+    }
+
     void serviceTask() {
+        service_task_handle_.store(xTaskGetCurrentTaskHandle(),
+                                   std::memory_order_release);
         const bool sink_attached = client_.attachRealtimeControlSink(this);
         TransportEventNotifier notifier;
         notifier.notify = transportEventReady;
         notifier.context = this;
-        const bool notifier_attached =
+        const bool transport_notifier_attached =
             sink_attached && client_.setTransportEventNotifier(notifier);
-        const bool begun = notifier_attached &&
+        AudioEventNotifier audio_notifier;
+        audio_notifier.notify = audioEventReady;
+        audio_notifier.context = this;
+        const bool audio_notifier_attached =
+            transport_notifier_attached &&
+            client_.setAudioEventNotifier(audio_notifier);
+        const bool begun = audio_notifier_attached &&
                            client_.begin(std::move(client_config_),
                                          makeDeferredCallbacks());
         // client_config_ only bridges the caller and service tasks. Client now
@@ -967,27 +1028,17 @@ private:
                 client_.loop();
                 snapshotClient();
                 ++service_cycles_;
-                const bool active = client_.sessionReady() ||
-                                    client_.state() == State::Connecting;
-                const uint16_t interval_ms =
-                    active ? runtime_config_.poll_interval_ms
-                           : runtime_config_.idle_poll_interval_ms;
-                const TickType_t poll_ticks =
-                    std::max<TickType_t>(1, pdMS_TO_TICKS(interval_ms));
-                Command command;
-                if (xQueueReceive(command_queue_, &command, poll_ticks) == pdTRUE) {
-                    // A control bit may have arrived while this task was
-                    // waiting on the normal queue. Preserve urgent priority.
-                    processUrgentControls();
-                    executeCommand(command);
-                    snapshotClient();
-                }
+                ulTaskNotifyTake(pdTRUE, timeoutTicks(nextServiceDelayMs()));
             }
             discardCommands();
             client_.end();
         }
 
-        if (notifier_attached) {
+        if (audio_notifier_attached) {
+            client_.setAudioEventNotifier({});
+        }
+
+        if (transport_notifier_attached) {
             client_.setTransportEventNotifier({});
         }
 
@@ -998,6 +1049,7 @@ private:
         snapshotClient();
         running_.store(false);
         task_active_.store(false);
+        service_task_handle_.store(nullptr, std::memory_order_release);
         xSemaphoreGive(stopped_signal_);
         vTaskDelete(nullptr);
     }
@@ -1106,6 +1158,7 @@ private:
         ++commands_queued_;
         updateHighWatermark(command_queue_high_watermark_,
                             uxQueueMessagesWaiting(command_queue_));
+        notifyServiceTask(false);
         return true;
     }
 
@@ -1310,9 +1363,6 @@ private:
     }
 
     void executeCommand(const Command& command) {
-        if (command.type == CommandType::TransportReady) {
-            return;
-        }
         bool accepted = false;
         switch (command.type) {
             case CommandType::StartListening:
@@ -1327,8 +1377,6 @@ private:
             case CommandType::SendMcp:
                 accepted = client_.sendMcp(
                     mcp_command_pool_.at(command.payload_slot).payload);
-                break;
-            case CommandType::TransportReady:
                 break;
         }
         ++commands_executed_;
@@ -1412,6 +1460,7 @@ private:
         ready_.store(false);
         session_ready_.store(false);
         pending_urgent_controls_.store(0);
+        service_task_handle_.store(nullptr, std::memory_order_release);
     }
 
     void resetStats() {
@@ -1460,6 +1509,8 @@ private:
         last_downlink_audio_ms_ = 0;
         playback_watchdog_armed_ = false;
         received_downlink_audio_ = false;
+        playback_retry_started_ms_ = 0;
+        playback_retry_pending_ = false;
         command_queue_high_watermark_.store(0);
         callback_queue_high_watermark_.store(0);
         audio_callback_queue_high_watermark_.store(0);

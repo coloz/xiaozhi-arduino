@@ -22,6 +22,16 @@ public:
                                         bool from_isr = false) = 0;
 };
 
+// Cross-task wakeup used by event-driven audio ports. The callback is a
+// notification only: workers must not call Client or Runtime methods through
+// it, block, or transfer payload ownership.
+struct AudioEventNotifier {
+    using Notify = void (*)(void* context);
+
+    Notify notify = nullptr;
+    void* context = nullptr;
+};
+
 // Hardware PCM interface. Board packages can implement this with ESP_I2S or a codec library.
 class AudioIo {
 public:
@@ -106,6 +116,13 @@ public:
     // workers should publish fixed-size control events here instead of waiting
     // for the Arduino loop to poll them.
     virtual void setRealtimeControlSink(RealtimeControlSink* sink) { (void)sink; }
+    // Event-driven ports notify after publishing uplink work and when playback
+    // progress may change a pending watchdog decision. Legacy ports retain the
+    // polling fallback by leaving eventDriven() false.
+    virtual bool eventDriven() const { return false; }
+    virtual void setEventNotifier(AudioEventNotifier notifier) {
+        (void)notifier;
+    }
 };
 
 }  // namespace xiaozhi

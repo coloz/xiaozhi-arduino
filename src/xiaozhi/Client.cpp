@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <limits>
 #include <utility>
 #include <vector>
 
@@ -576,6 +577,37 @@ bool Client::setPlaybackMuted(bool muted) {
     return audio_port_->setPlaybackMuted(muted);
 }
 
+uint32_t Client::nextProtocolDeadlineMs() const {
+    uint64_t deadline_ms = 0;
+    if (awaiting_hello_) {
+        deadline_ms = handshake_started_ms_ + config_.handshake_timeout_ms;
+    }
+    if (session_ready_ && last_incoming_ms_ != 0) {
+        // Client::loop() treats channel_timeout_ms itself as the final valid
+        // millisecond, so schedule the first expired instant.
+        const uint64_t channel_deadline =
+            last_incoming_ms_ + config_.channel_timeout_ms + 1;
+        if (deadline_ms == 0 || channel_deadline < deadline_ms) {
+            deadline_ms = channel_deadline;
+        }
+    }
+    if (deadline_ms == 0) {
+        return std::numeric_limits<uint32_t>::max();
+    }
+    const uint64_t now_ms = clock_.nowMs();
+    if (deadline_ms <= now_ms) {
+        return 0;
+    }
+    return static_cast<uint32_t>(std::min<uint64_t>(
+        deadline_ms - now_ms, std::numeric_limits<uint32_t>::max()));
+}
+
+bool Client::pollingRequired() const {
+    return !transport_.asynchronous() ||
+           (audio_port_started_ && audio_port_ != nullptr &&
+            !audio_port_->eventDriven());
+}
+
 bool Client::attachRealtimeControlSink(RealtimeControlSink* sink) {
     DispatchScope dispatch(*this);
     if (user_callback_depth_ != 0 || end_requested_ || begun_) {
@@ -594,6 +626,17 @@ bool Client::setTransportEventNotifier(TransportEventNotifier notifier) {
         return false;
     }
     transport_.setEventNotifier(notifier);
+    return true;
+}
+
+bool Client::setAudioEventNotifier(AudioEventNotifier notifier) {
+    DispatchScope dispatch(*this);
+    if (user_callback_depth_ != 0 || begun_ || begin_in_progress_ || ending_) {
+        return false;
+    }
+    if (audio_port_ != nullptr) {
+        audio_port_->setEventNotifier(notifier);
+    }
     return true;
 }
 

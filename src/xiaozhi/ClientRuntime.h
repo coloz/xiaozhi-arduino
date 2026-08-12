@@ -44,9 +44,12 @@ struct ClientRuntimeConfig {
     // Pinning to core 0 isolates the runtime from Arduino's usual loopTask on
     // core 1. Set to -1 to let FreeRTOS choose a core.
     int8_t task_core = 0;
-    // Active sessions are polled aggressively; idle waits are longer but a
-    // queued command wakes the task immediately.
+    // Compatibility fallback for synchronous transports and legacy audio
+    // ports that do not implement event notifications. AsyncTransport plus an
+    // event-driven audio port does not poll at this interval.
     uint16_t poll_interval_ms = 2;
+    // Retry cadence only after an expired playback watchdog finds hardware
+    // still draining. Ordinary event-driven idle waits have no periodic wake.
     uint16_t idle_poll_interval_ms = 20;
     uint8_t command_queue_depth = 8;
     // Reliable event/error/wake queue. State and capture use independent

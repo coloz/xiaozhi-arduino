@@ -383,6 +383,8 @@ class I2sOpusAudioPort final : public xiaozhi::EncodedAudioPort {
   void onClientStateChanged(xiaozhi::State oldState,
                             xiaozhi::State newState) override;
   void setRealtimeControlSink(xiaozhi::RealtimeControlSink* sink) override;
+  bool eventDriven() const override { return true; }
+  void setEventNotifier(xiaozhi::AudioEventNotifier notifier) override;
 
   // Legacy polling fallback for direct Client users without ClientRuntime.
   void setWakeDetectionEnabled(bool enabled);

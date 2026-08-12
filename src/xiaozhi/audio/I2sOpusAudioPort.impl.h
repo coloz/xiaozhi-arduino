@@ -327,6 +327,9 @@ struct I2sOpusAudioPort::Impl {
   std::atomic<bool> outputTaskExited{true};
   bool decodeInFlight = false;
   bool outputInFlight = false;
+  // Owned by outputTask. Publish exactly one Runtime event when the hardware
+  // crosses playbackIdleDelayMs after a drained generation.
+  bool playbackIdleEventPublished = true;
   std::atomic<uint32_t> playbackGeneration{1};
   std::atomic<bool> decoderResetRequested{false};
   std::atomic<uint32_t> lastPlaybackWriteMs{0};
@@ -367,6 +370,8 @@ struct I2sOpusAudioPort::Impl {
   std::atomic<bool> wakeDetected{false};
   std::atomic<uint32_t> wakeDetectedGeneration{0};
   std::atomic<xiaozhi::RealtimeControlSink*> realtimeControlSink{nullptr};
+  std::atomic<xiaozhi::AudioEventNotifier::Notify> eventNotifier{nullptr};
+  std::atomic<void*> eventNotifierContext{nullptr};
   std::atomic<bool> wakeTaskRunning{false};
   std::atomic<bool> wakeTaskExited{true};
   TaskHandle_t wakeTask = nullptr;
@@ -375,6 +380,14 @@ struct I2sOpusAudioPort::Impl {
   const esp_wn_iface_t* wakeNet = nullptr;
   model_iface_data_t* wakeNetData = nullptr;
 #endif
+
+  void notifyAudioEvent() {
+    const xiaozhi::AudioEventNotifier::Notify notify =
+        eventNotifier.load(std::memory_order_acquire);
+    if (notify != nullptr) {
+      notify(eventNotifierContext.load(std::memory_order_relaxed));
+    }
+  }
   size_t wakeChunkSamples = 0;
   char lastWakeWord[96]{};
   std::vector<int16_t> wakeCaptured;
@@ -1781,6 +1794,7 @@ struct I2sOpusAudioPort::Impl {
         break;
       }
       if (haveChunk) {
+        playbackIdleEventPublished = false;
         const bool played = writePlaybackChunk(chunk);
         if (xSemaphoreTake(queueMutex, portMAX_DELAY) == pdTRUE) {
           // cancelPlayback() invalidates the generation before taking this
@@ -1798,6 +1812,9 @@ struct I2sOpusAudioPort::Impl {
         if (decoderTask != nullptr) {
           xTaskNotifyGive(decoderTask);
         }
+        // Playback progress can satisfy Runtime's watchdog once the queue and
+        // codec idle delay drain; wake it without calling Client from here.
+        notifyAudioEvent();
         continue;
       }
 
@@ -1813,6 +1830,11 @@ struct I2sOpusAudioPort::Impl {
                  millis() - lastPlaybackWriteMs.load() >
                      config.playbackMuteDelayMs) {
         applyCodecMute(true);
+      }
+      if (drained && !playbackIdleEventPublished &&
+          millis() - lastPlaybackWriteMs.load() > config.playbackIdleDelayMs) {
+        playbackIdleEventPublished = true;
+        notifyAudioEvent();
       }
       ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(20));
     }
@@ -2200,6 +2222,9 @@ struct I2sOpusAudioPort::Impl {
     if (!queued) {
       return;
     }
+    // The Runtime owns Uplink invocation. Publish only after the fixed queue
+    // has committed the packet so its next Client::loop() can consume it.
+    notifyAudioEvent();
     const uint32_t packetNumber = ++capturedPackets;
     if (packetNumber == 1 ||
         packetNumber % config.captureLogIntervalPackets == 0) {
@@ -3006,6 +3031,21 @@ void I2sOpusAudioPort::setRealtimeControlSink(
   if (impl_ != nullptr) {
     impl_->realtimeControlSink.store(sink, std::memory_order_release);
   }
+}
+
+void I2sOpusAudioPort::setEventNotifier(
+    xiaozhi::AudioEventNotifier notifier) {
+  if (impl_ == nullptr) {
+    return;
+  }
+  if (notifier.notify == nullptr) {
+    impl_->eventNotifier.store(nullptr, std::memory_order_release);
+    impl_->eventNotifierContext.store(nullptr, std::memory_order_relaxed);
+    return;
+  }
+  impl_->eventNotifierContext.store(notifier.context,
+                                    std::memory_order_relaxed);
+  impl_->eventNotifier.store(notifier.notify, std::memory_order_release);
 }
 
 void I2sOpusAudioPort::setWakeDetectionEnabled(bool enabled) {
