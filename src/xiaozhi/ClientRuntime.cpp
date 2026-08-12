@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <limits>
 #include <new>
+#include <type_traits>
 #include <utility>
 
 namespace xiaozhi {
@@ -43,6 +44,65 @@ void updateMaximum(std::atomic<uint32_t>& maximum, uint32_t value) {
     }
 }
 
+template <typename T>
+class FixedSlotPool {
+public:
+    bool initialize(uint8_t capacity) {
+        reset();
+        if (capacity == 0 || capacity > 32) {
+            return false;
+        }
+        slots_.reset(new (std::nothrow) T[capacity]);
+        if (!slots_) {
+            return false;
+        }
+        capacity_ = capacity;
+        free_mask_.store(capacity == 32 ? std::numeric_limits<uint32_t>::max()
+                                        : ((1U << capacity) - 1U));
+        return true;
+    }
+
+    T* acquire(uint8_t& index) {
+        uint32_t available = free_mask_.load(std::memory_order_relaxed);
+        while (available != 0) {
+            uint8_t candidate = 0;
+            while ((available & (1U << candidate)) == 0) {
+                ++candidate;
+            }
+            const uint32_t desired = available & ~(1U << candidate);
+            if (free_mask_.compare_exchange_weak(
+                    available, desired, std::memory_order_acquire,
+                    std::memory_order_relaxed)) {
+                index = candidate;
+                return &slots_[candidate];
+            }
+        }
+        return nullptr;
+    }
+
+    T& at(uint8_t index) { return slots_[index]; }
+    const T& at(uint8_t index) const { return slots_[index]; }
+
+    void release(uint8_t index) {
+        if (index >= capacity_) {
+            return;
+        }
+        slots_[index].clear();
+        free_mask_.fetch_or(1U << index, std::memory_order_release);
+    }
+
+    void reset() {
+        free_mask_.store(0);
+        slots_.reset();
+        capacity_ = 0;
+    }
+
+private:
+    std::unique_ptr<T[]> slots_;
+    std::atomic<uint32_t> free_mask_{0};
+    uint8_t capacity_ = 0;
+};
+
 uint32_t runtimeNowMs() {
     return static_cast<uint32_t>(esp_timer_get_time() / 1000);
 }
@@ -60,7 +120,8 @@ public:
 
     bool begin(const ClientConfig& client_config, Callbacks callbacks,
                const ClientRuntimeConfig& runtime_config) {
-        if (task_active_.load() || running_.load() ||
+        if (callback_dispatch_depth_.load() != 0 || task_active_.load() ||
+            running_.load() ||
             !validConfig(runtime_config)) {
             return false;
         }
@@ -74,15 +135,15 @@ public:
         resetStats();
 
         command_queue_ = xQueueCreate(runtime_config_.command_queue_depth,
-                                      sizeof(Command*));
+                                      sizeof(Command));
         callback_queue_ = xQueueCreate(runtime_config_.callback_queue_depth,
-                                       sizeof(CallbackMessage*));
+                                       sizeof(CallbackMessage));
         wake_event_queue_ = xQueueCreate(1, sizeof(WakeEvent));
         startup_signal_ = xSemaphoreCreateBinary();
         stopped_signal_ = xSemaphoreCreateBinary();
         if (command_queue_ == nullptr || callback_queue_ == nullptr ||
             wake_event_queue_ == nullptr || startup_signal_ == nullptr ||
-            stopped_signal_ == nullptr) {
+            stopped_signal_ == nullptr || !initializePayloadPools()) {
             releaseResources();
             return false;
         }
@@ -108,12 +169,19 @@ public:
         const bool succeeded = startup_succeeded_.load();
         if (!succeeded) {
             xSemaphoreTake(stopped_signal_, portMAX_DELAY);
+            releaseResources();
         }
         return succeeded;
     }
 
     bool end(uint32_t timeout_ms) {
+        // A callback payload is a borrowed pool slot until the callback
+        // returns. Reject reentrant teardown so loop() can release it safely.
+        if (callback_dispatch_depth_.load() != 0) {
+            return false;
+        }
         if (!task_active_.load() && !running_.load()) {
+            releaseResources();
             return true;
         }
         stop_requested_.store(true);
@@ -121,6 +189,7 @@ public:
             xSemaphoreTake(stopped_signal_, timeoutTicks(timeout_ms)) != pdTRUE) {
             return false;
         }
+        releaseResources();
         return true;
     }
 
@@ -129,14 +198,14 @@ public:
             return 0;
         }
         size_t dispatched = 0;
-        CallbackMessage* message = nullptr;
+        CallbackMessage message;
         while ((max_callbacks == 0 || dispatched < max_callbacks) &&
                xQueueReceive(callback_queue_, &message, 0) == pdTRUE) {
-            if (message != nullptr) {
-                dispatchCallback(*message);
-                delete message;
-                ++callbacks_dispatched_;
-            }
+            callback_dispatch_depth_.fetch_add(1);
+            dispatchCallback(message);
+            releaseCallbackPayload(message);
+            callback_dispatch_depth_.fetch_sub(1);
+            ++callbacks_dispatched_;
             ++dispatched;
             if (callback_queue_ == nullptr) {
                 break;
@@ -146,10 +215,9 @@ public:
     }
 
     bool requestStartListening(ListeningMode mode) {
-        Command* command = allocateCommand(CommandType::StartListening);
-        if (command != nullptr) {
-            command->listening_mode = mode;
-        }
+        Command command;
+        command.type = CommandType::StartListening;
+        command.listening_mode = mode;
         return enqueueCommand(command);
     }
 
@@ -158,7 +226,9 @@ public:
     }
 
     bool requestToggleChat() {
-        return enqueueCommand(allocateCommand(CommandType::ToggleChat));
+        Command command;
+        command.type = CommandType::ToggleChat;
+        return enqueueCommand(command);
     }
 
     bool requestAbortSpeaking(AbortReason reason) {
@@ -198,14 +268,28 @@ public:
     }
 
     bool requestCloseSession() {
-        return enqueueCommand(allocateCommand(CommandType::CloseSession));
+        Command command;
+        command.type = CommandType::CloseSession;
+        return enqueueCommand(command);
     }
 
     bool requestSendMcp(const std::string& payload) {
-        Command* command = allocateCommand(CommandType::SendMcp);
-        if (command != nullptr) {
-            command->payload = payload;
+        if (payload.empty() ||
+            payload.size() > runtime_config_.maximum_mcp_payload_bytes ||
+            !running_.load() || stop_requested_.load()) {
+            ++commands_rejected_;
+            return false;
         }
+        Command command;
+        command.type = CommandType::SendMcp;
+        McpCommandSlot* slot = mcp_command_pool_.acquire(command.payload_slot);
+        if (slot == nullptr) {
+            ++command_pool_exhausted_;
+            ++commands_rejected_;
+            return false;
+        }
+        noteCommandPayloadAcquired();
+        slot->payload.assign(payload.data(), payload.size());
         return enqueueCommand(command);
     }
 
@@ -292,6 +376,18 @@ public:
         output.urgent_controls_executed = urgent_controls_executed_.load();
         output.urgent_controls_coalesced = urgent_controls_coalesced_.load();
         output.urgent_controls_rejected = urgent_controls_rejected_.load();
+        output.command_pool_exhausted = command_pool_exhausted_.load();
+        output.callback_pool_exhausted = callback_pool_exhausted_.load();
+        output.state_callbacks_dropped = state_callbacks_dropped_.load();
+        output.wake_callbacks_dropped = wake_callbacks_dropped_.load();
+        output.event_callbacks_dropped = event_callbacks_dropped_.load();
+        output.audio_callbacks_dropped = audio_callbacks_dropped_.load();
+        output.capture_callbacks_dropped = capture_callbacks_dropped_.load();
+        output.error_callbacks_dropped = error_callbacks_dropped_.load();
+        output.command_payload_pool_high_watermark =
+            command_payload_pool_high_watermark_.load();
+        output.callback_payload_pool_high_watermark =
+            callback_payload_pool_high_watermark_.load();
         output.command_queue_high_watermark = command_queue_high_watermark_.load();
         output.callback_queue_high_watermark = callback_queue_high_watermark_.load();
         return output;
@@ -306,10 +402,14 @@ private:
     };
 
     struct Command {
-        explicit Command(CommandType value) : type(value) {}
-        CommandType type;
+        CommandType type = CommandType::ToggleChat;
         ListeningMode listening_mode = ListeningMode::ManualStop;
+        uint8_t payload_slot = 0xFF;
+    };
+
+    struct McpCommandSlot {
         std::string payload;
+        void clear() { payload.clear(); }
     };
 
     struct WakeEvent {
@@ -327,18 +427,53 @@ private:
     };
 
     struct CallbackMessage {
-        explicit CallbackMessage(CallbackType value) : type(value) {}
-        CallbackType type;
+        CallbackType type = CallbackType::StateChanged;
         State old_state = State::Unknown;
         State new_state = State::Unknown;
-        std::string wake_word;
-        Event event;
-        AudioFrame audio;
         bool capture_enabled = false;
         AudioFormat capture_format;
-        ErrorCode error_code = ErrorCode::None;
-        std::string error_message;
+        uint8_t payload_slot = 0xFF;
     };
+
+    struct WakeCallbackSlot {
+        std::string text;
+        void clear() { text.clear(); }
+    };
+
+    struct EventCallbackSlot {
+        Event event;
+        void clear() {
+            event.type = EventType::UnknownMessage;
+            event.text.clear();
+            event.status.clear();
+            event.emotion.clear();
+            event.json.clear();
+            event.emotion_type = Emotion::Unknown;
+        }
+    };
+
+    struct AudioCallbackSlot {
+        AudioFrame audio;
+        void clear() {
+            audio.format = {};
+            audio.timestamp = 0;
+            audio.opus.clear();
+        }
+    };
+
+    struct ErrorCallbackSlot {
+        ErrorCode code = ErrorCode::None;
+        std::string message;
+        void clear() {
+            code = ErrorCode::None;
+            message.clear();
+        }
+    };
+
+    static_assert(std::is_trivially_copyable<Command>::value,
+                  "FreeRTOS command queues require byte-copyable messages");
+    static_assert(std::is_trivially_copyable<CallbackMessage>::value,
+                  "FreeRTOS callback queues require byte-copyable messages");
 
     Client& client_;
     ClientConfig client_config_;
@@ -349,12 +484,19 @@ private:
     QueueHandle_t wake_event_queue_ = nullptr;
     SemaphoreHandle_t startup_signal_ = nullptr;
     SemaphoreHandle_t stopped_signal_ = nullptr;
+    FixedSlotPool<McpCommandSlot> mcp_command_pool_;
+    FixedSlotPool<WakeCallbackSlot> wake_callback_pool_;
+    FixedSlotPool<EventCallbackSlot> event_callback_pool_;
+    FixedSlotPool<AudioCallbackSlot> audio_callback_pool_;
+    FixedSlotPool<ErrorCallbackSlot> error_callback_pool_;
+    std::string wake_word_scratch_;
     std::atomic<bool> task_active_{false};
     std::atomic<bool> running_{false};
     std::atomic<bool> ready_{false};
     std::atomic<bool> session_ready_{false};
     std::atomic<bool> stop_requested_{false};
     std::atomic<bool> startup_succeeded_{false};
+    std::atomic<uint32_t> callback_dispatch_depth_{0};
     std::atomic<State> state_{State::Unknown};
     std::atomic<uint32_t> service_cycles_{0};
     std::atomic<uint32_t> commands_queued_{0};
@@ -382,6 +524,18 @@ private:
     std::atomic<uint32_t> urgent_controls_executed_{0};
     std::atomic<uint32_t> urgent_controls_coalesced_{0};
     std::atomic<uint32_t> urgent_controls_rejected_{0};
+    std::atomic<uint32_t> command_pool_exhausted_{0};
+    std::atomic<uint32_t> callback_pool_exhausted_{0};
+    std::atomic<uint32_t> state_callbacks_dropped_{0};
+    std::atomic<uint32_t> wake_callbacks_dropped_{0};
+    std::atomic<uint32_t> event_callbacks_dropped_{0};
+    std::atomic<uint32_t> audio_callbacks_dropped_{0};
+    std::atomic<uint32_t> capture_callbacks_dropped_{0};
+    std::atomic<uint32_t> error_callbacks_dropped_{0};
+    std::atomic<uint8_t> command_payloads_in_use_{0};
+    std::atomic<uint8_t> callback_payloads_in_use_{0};
+    std::atomic<uint8_t> command_payload_pool_high_watermark_{0};
+    std::atomic<uint8_t> callback_payload_pool_high_watermark_{0};
     std::atomic<uint8_t> command_queue_high_watermark_{0};
     std::atomic<uint8_t> callback_queue_high_watermark_{0};
 
@@ -425,6 +579,30 @@ private:
                config.idle_poll_interval_ms <= 1000 &&
                config.command_queue_depth > 0 && config.callback_queue_depth > 0 &&
                config.maximum_commands_per_cycle > 0 &&
+               config.mcp_command_pool_depth > 0 &&
+               config.mcp_command_pool_depth <= 32 &&
+               config.event_callback_pool_depth > 0 &&
+               config.event_callback_pool_depth <= 32 &&
+               config.audio_callback_pool_depth > 0 &&
+               config.audio_callback_pool_depth <= 32 &&
+               config.error_callback_pool_depth > 0 &&
+               config.error_callback_pool_depth <= 32 &&
+               config.wake_callback_pool_depth > 0 &&
+               config.wake_callback_pool_depth <= 32 &&
+               config.maximum_mcp_payload_bytes > 0 &&
+               config.maximum_mcp_payload_bytes <= 16384 &&
+               config.maximum_event_text_bytes > 0 &&
+               config.maximum_event_text_bytes <= 16384 &&
+               config.maximum_event_status_bytes > 0 &&
+               config.maximum_event_status_bytes <= 1024 &&
+               config.maximum_event_emotion_bytes > 0 &&
+               config.maximum_event_emotion_bytes <= 256 &&
+               config.maximum_event_json_bytes > 0 &&
+               config.maximum_event_json_bytes <= 16384 &&
+               config.maximum_audio_callback_bytes > 0 &&
+               config.maximum_audio_callback_bytes <= 8192 &&
+               config.maximum_error_message_bytes > 0 &&
+               config.maximum_error_message_bytes <= 2048 &&
                (!config.playback_watchdog.enabled ||
                 (config.playback_watchdog.first_audio_timeout_ms > 0 &&
                  config.playback_watchdog.first_audio_timeout_ms <= 3600000 &&
@@ -433,6 +611,64 @@ private:
                (config.lifecycle.on_state_changed == nullptr ||
                 (config.lifecycle.maximum_execution_us > 0 &&
                  config.lifecycle.maximum_execution_us <= 1000000));
+    }
+
+    bool initializePayloadPools() {
+        if (!mcp_command_pool_.initialize(
+                runtime_config_.mcp_command_pool_depth) ||
+            (user_callbacks_.on_wake_word &&
+             !wake_callback_pool_.initialize(
+                 runtime_config_.wake_callback_pool_depth)) ||
+            (user_callbacks_.on_event &&
+             !event_callback_pool_.initialize(
+                 runtime_config_.event_callback_pool_depth)) ||
+            (user_callbacks_.on_audio &&
+             !audio_callback_pool_.initialize(
+                 runtime_config_.audio_callback_pool_depth)) ||
+            (user_callbacks_.on_error &&
+             !error_callback_pool_.initialize(
+                 runtime_config_.error_callback_pool_depth))) {
+            return false;
+        }
+        for (uint8_t index = 0;
+             index < runtime_config_.mcp_command_pool_depth; ++index) {
+            mcp_command_pool_.at(index).payload.reserve(
+                runtime_config_.maximum_mcp_payload_bytes);
+        }
+        wake_word_scratch_.reserve(RealtimeControlSink::kMaximumWakeWordBytes);
+        if (user_callbacks_.on_wake_word) {
+            for (uint8_t index = 0;
+                 index < runtime_config_.wake_callback_pool_depth; ++index) {
+                wake_callback_pool_.at(index).text.reserve(
+                    RealtimeControlSink::kMaximumWakeWordBytes);
+            }
+        }
+        if (user_callbacks_.on_event) {
+            for (uint8_t index = 0;
+                 index < runtime_config_.event_callback_pool_depth; ++index) {
+                Event& event = event_callback_pool_.at(index).event;
+                event.text.reserve(runtime_config_.maximum_event_text_bytes);
+                event.status.reserve(runtime_config_.maximum_event_status_bytes);
+                event.emotion.reserve(
+                    runtime_config_.maximum_event_emotion_bytes);
+                event.json.reserve(runtime_config_.maximum_event_json_bytes);
+            }
+        }
+        if (user_callbacks_.on_audio) {
+            for (uint8_t index = 0;
+                 index < runtime_config_.audio_callback_pool_depth; ++index) {
+                audio_callback_pool_.at(index).audio.opus.reserve(
+                    runtime_config_.maximum_audio_callback_bytes);
+            }
+        }
+        if (user_callbacks_.on_error) {
+            for (uint8_t index = 0;
+                 index < runtime_config_.error_callback_pool_depth; ++index) {
+                error_callback_pool_.at(index).message.reserve(
+                    runtime_config_.maximum_error_message_bytes);
+            }
+        }
+        return true;
     }
 
     Callbacks makeDeferredCallbacks() {
@@ -447,22 +683,41 @@ private:
                 // has completed, so readers cannot observe a half-applied state.
                 state_.store(new_state);
                 if (user_callbacks_.on_state_changed) {
-                    CallbackMessage* message =
-                        allocateCallback(CallbackType::StateChanged);
-                    if (message != nullptr) {
-                        message->old_state = old_state;
-                        message->new_state = new_state;
-                    }
+                    CallbackMessage message;
+                    message.type = CallbackType::StateChanged;
+                    message.old_state = old_state;
+                    message.new_state = new_state;
                     enqueueCallback(message);
                 }
             };
         }
         if (user_callbacks_.on_event) {
             callbacks.on_event = [this](const Event& event) {
-                CallbackMessage* message = allocateCallback(CallbackType::Event);
-                if (message != nullptr) {
-                    message->event = event;
+                if (event.text.size() > runtime_config_.maximum_event_text_bytes ||
+                    event.status.size() >
+                        runtime_config_.maximum_event_status_bytes ||
+                    event.emotion.size() >
+                        runtime_config_.maximum_event_emotion_bytes ||
+                    event.json.size() > runtime_config_.maximum_event_json_bytes) {
+                    recordCallbackDrop(CallbackType::Event);
+                    return;
                 }
+                CallbackMessage message;
+                message.type = CallbackType::Event;
+                EventCallbackSlot* slot =
+                    event_callback_pool_.acquire(message.payload_slot);
+                if (slot == nullptr) {
+                    ++callback_pool_exhausted_;
+                    recordCallbackDrop(CallbackType::Event);
+                    return;
+                }
+                noteCallbackPayloadAcquired();
+                slot->event.type = event.type;
+                slot->event.text.assign(event.text.data(), event.text.size());
+                slot->event.status.assign(event.status.data(), event.status.size());
+                slot->event.emotion.assign(event.emotion.data(), event.emotion.size());
+                slot->event.json.assign(event.json.data(), event.json.size());
+                slot->event.emotion_type = event.emotion_type;
                 enqueueCallback(message);
             };
         }
@@ -478,33 +733,57 @@ private:
                 // best-effort callback queue.
                 if (callback_queue_ == nullptr ||
                     uxQueueSpacesAvailable(callback_queue_) == 0) {
-                    ++callbacks_dropped_;
+                    recordCallbackDrop(CallbackType::Audio);
                     return;
                 }
-                CallbackMessage* message = allocateCallback(CallbackType::Audio);
-                if (message != nullptr) {
-                    message->audio = audio;
+                if (audio.opus.size() >
+                    runtime_config_.maximum_audio_callback_bytes) {
+                    recordCallbackDrop(CallbackType::Audio);
+                    return;
                 }
+                CallbackMessage message;
+                message.type = CallbackType::Audio;
+                AudioCallbackSlot* slot =
+                    audio_callback_pool_.acquire(message.payload_slot);
+                if (slot == nullptr) {
+                    ++callback_pool_exhausted_;
+                    recordCallbackDrop(CallbackType::Audio);
+                    return;
+                }
+                noteCallbackPayloadAcquired();
+                slot->audio.format = audio.format;
+                slot->audio.timestamp = audio.timestamp;
+                slot->audio.opus.assign(audio.opus.begin(), audio.opus.end());
                 enqueueCallback(message);
             };
         }
         if (user_callbacks_.on_capture) {
             callbacks.on_capture = [this](bool enabled, const AudioFormat& format) {
-                CallbackMessage* message = allocateCallback(CallbackType::Capture);
-                if (message != nullptr) {
-                    message->capture_enabled = enabled;
-                    message->capture_format = format;
-                }
+                CallbackMessage message;
+                message.type = CallbackType::Capture;
+                message.capture_enabled = enabled;
+                message.capture_format = format;
                 enqueueCallback(message);
             };
         }
         if (user_callbacks_.on_error) {
             callbacks.on_error = [this](ErrorCode code, const std::string& error) {
-                CallbackMessage* message = allocateCallback(CallbackType::Error);
-                if (message != nullptr) {
-                    message->error_code = code;
-                    message->error_message = error;
+                if (error.size() > runtime_config_.maximum_error_message_bytes) {
+                    recordCallbackDrop(CallbackType::Error);
+                    return;
                 }
+                CallbackMessage message;
+                message.type = CallbackType::Error;
+                ErrorCallbackSlot* slot =
+                    error_callback_pool_.acquire(message.payload_slot);
+                if (slot == nullptr) {
+                    ++callback_pool_exhausted_;
+                    recordCallbackDrop(CallbackType::Error);
+                    return;
+                }
+                noteCallbackPayloadAcquired();
+                slot->code = code;
+                slot->message.assign(error.data(), error.size());
                 enqueueCallback(message);
             };
         }
@@ -631,7 +910,7 @@ private:
                            : runtime_config_.idle_poll_interval_ms;
                 const TickType_t poll_ticks =
                     std::max<TickType_t>(1, pdMS_TO_TICKS(interval_ms));
-                Command* command = nullptr;
+                Command command;
                 if (xQueueReceive(command_queue_, &command, poll_ticks) == pdTRUE) {
                     // A control bit may have arrived while this task was
                     // waiting on the normal queue. Preserve urgent priority.
@@ -658,13 +937,11 @@ private:
     void processCommands() {
         for (uint8_t index = 0; index < runtime_config_.maximum_commands_per_cycle;
              ++index) {
-            Command* command = nullptr;
+            Command command;
             if (xQueueReceive(command_queue_, &command, 0) != pdTRUE) {
                 return;
             }
-            if (command != nullptr) {
-                executeCommand(command);
-            }
+            executeCommand(command);
             snapshotClient();
             if (stop_requested_.load()) {
                 return;
@@ -725,32 +1002,37 @@ private:
             ++urgent_controls_rejected_;
             return;
         }
-        std::string wake_word(event.text, event.size);
-        if (!client_.wakeWordDetected(wake_word)) {
+        wake_word_scratch_.assign(event.text, event.size);
+        if (!client_.wakeWordDetected(wake_word_scratch_)) {
             ++wake_events_rejected_;
             ++urgent_controls_rejected_;
             return;
         }
         ++wake_events_executed_;
-        enqueueWakeObserver(std::move(wake_word));
+        enqueueWakeObserver(wake_word_scratch_.data(), wake_word_scratch_.size());
     }
 
-    Command* allocateCommand(CommandType type) {
-        if (!running_.load() || stop_requested_.load()) {
-            return nullptr;
+    void noteCommandPayloadAcquired() {
+        const uint8_t in_use = command_payloads_in_use_.fetch_add(1) + 1;
+        updateHighWatermark(command_payload_pool_high_watermark_, in_use);
+    }
+
+    void releaseCommandPayload(const Command& command) {
+        if (command.type == CommandType::SendMcp && command.payload_slot != 0xFF) {
+            mcp_command_pool_.release(command.payload_slot);
+            command_payloads_in_use_.fetch_sub(1);
         }
-        return new (std::nothrow) Command(type);
     }
 
-    bool enqueueCommand(Command* command) {
-        if (command == nullptr || command_queue_ == nullptr || !running_.load() ||
+    bool enqueueCommand(const Command& command) {
+        if (command_queue_ == nullptr || !running_.load() ||
             stop_requested_.load()) {
-            delete command;
+            releaseCommandPayload(command);
             ++commands_rejected_;
             return false;
         }
         if (xQueueSend(command_queue_, &command, 0) != pdTRUE) {
-            delete command;
+            releaseCommandPayload(command);
             ++commands_rejected_;
             return false;
         }
@@ -760,39 +1042,81 @@ private:
         return true;
     }
 
-    CallbackMessage* allocateCallback(CallbackType type) {
-        CallbackMessage* message = new (std::nothrow) CallbackMessage(type);
-        if (message == nullptr) {
-            ++callbacks_dropped_;
-        }
-        return message;
+    void noteCallbackPayloadAcquired() {
+        const uint8_t in_use = callback_payloads_in_use_.fetch_add(1) + 1;
+        updateHighWatermark(callback_payload_pool_high_watermark_, in_use);
     }
 
-    void enqueueCallback(CallbackMessage* message) {
-        if (message == nullptr) {
+    void recordCallbackDrop(CallbackType type) {
+        ++callbacks_dropped_;
+        switch (type) {
+            case CallbackType::StateChanged:
+                ++state_callbacks_dropped_;
+                break;
+            case CallbackType::WakeWord:
+                ++wake_callbacks_dropped_;
+                break;
+            case CallbackType::Event:
+                ++event_callbacks_dropped_;
+                break;
+            case CallbackType::Audio:
+                ++audio_callbacks_dropped_;
+                break;
+            case CallbackType::Capture:
+                ++capture_callbacks_dropped_;
+                break;
+            case CallbackType::Error:
+                ++error_callbacks_dropped_;
+                break;
+        }
+    }
+
+    void releaseCallbackPayload(const CallbackMessage& message) {
+        if (message.payload_slot == 0xFF) {
             return;
         }
+        switch (message.type) {
+            case CallbackType::WakeWord:
+                wake_callback_pool_.release(message.payload_slot);
+                break;
+            case CallbackType::Event:
+                event_callback_pool_.release(message.payload_slot);
+                break;
+            case CallbackType::Audio:
+                audio_callback_pool_.release(message.payload_slot);
+                break;
+            case CallbackType::Error:
+                error_callback_pool_.release(message.payload_slot);
+                break;
+            case CallbackType::StateChanged:
+            case CallbackType::Capture:
+                return;
+        }
+        callback_payloads_in_use_.fetch_sub(1);
+    }
+
+    void enqueueCallback(const CallbackMessage& message) {
         if (callback_queue_ == nullptr) {
-            delete message;
-            ++callbacks_dropped_;
+            releaseCallbackPayload(message);
+            recordCallbackDrop(message.type);
             return;
         }
         if (xQueueSend(callback_queue_, &message, 0) != pdTRUE) {
-            if (message->type == CallbackType::Audio) {
-                delete message;
-                ++callbacks_dropped_;
+            if (message.type == CallbackType::Audio) {
+                releaseCallbackPayload(message);
+                recordCallbackDrop(message.type);
                 return;
             }
             // State/event/error delivery has priority over a stale observer
             // backlog. Evict one oldest callback, never wait on user code.
-            CallbackMessage* oldest = nullptr;
+            CallbackMessage oldest;
             if (xQueueReceive(callback_queue_, &oldest, 0) == pdTRUE) {
-                delete oldest;
-                ++callbacks_dropped_;
+                releaseCallbackPayload(oldest);
+                recordCallbackDrop(oldest.type);
             }
             if (xQueueSend(callback_queue_, &message, 0) != pdTRUE) {
-                delete message;
-                ++callbacks_dropped_;
+                releaseCallbackPayload(message);
+                recordCallbackDrop(message.type);
                 return;
             }
         }
@@ -801,14 +1125,21 @@ private:
                             uxQueueMessagesWaiting(callback_queue_));
     }
 
-    void enqueueWakeObserver(std::string wake_word) {
+    void enqueueWakeObserver(const char* wake_word, size_t size) {
         if (!user_callbacks_.on_wake_word) {
             return;
         }
-        CallbackMessage* message = allocateCallback(CallbackType::WakeWord);
-        if (message != nullptr) {
-            message->wake_word = std::move(wake_word);
+        CallbackMessage message;
+        message.type = CallbackType::WakeWord;
+        WakeCallbackSlot* slot =
+            wake_callback_pool_.acquire(message.payload_slot);
+        if (slot == nullptr) {
+            ++callback_pool_exhausted_;
+            recordCallbackDrop(CallbackType::WakeWord);
+            return;
         }
+        noteCallbackPayloadAcquired();
+        slot->text.assign(wake_word, size);
         enqueueCallback(message);
     }
 
@@ -821,17 +1152,20 @@ private:
                 break;
             case CallbackType::WakeWord:
                 if (user_callbacks_.on_wake_word) {
-                    user_callbacks_.on_wake_word(message.wake_word);
+                    user_callbacks_.on_wake_word(
+                        wake_callback_pool_.at(message.payload_slot).text);
                 }
                 break;
             case CallbackType::Event:
                 if (user_callbacks_.on_event) {
-                    user_callbacks_.on_event(message.event);
+                    user_callbacks_.on_event(
+                        event_callback_pool_.at(message.payload_slot).event);
                 }
                 break;
             case CallbackType::Audio:
                 if (user_callbacks_.on_audio) {
-                    user_callbacks_.on_audio(message.audio);
+                    user_callbacks_.on_audio(
+                        audio_callback_pool_.at(message.payload_slot).audio);
                 }
                 break;
             case CallbackType::Capture:
@@ -842,7 +1176,9 @@ private:
                 break;
             case CallbackType::Error:
                 if (user_callbacks_.on_error) {
-                    user_callbacks_.on_error(message.error_code, message.error_message);
+                    const ErrorCallbackSlot& slot =
+                        error_callback_pool_.at(message.payload_slot);
+                    user_callbacks_.on_error(slot.code, slot.message);
                 }
                 break;
         }
@@ -854,14 +1190,11 @@ private:
         state_.store(client_.state());
     }
 
-    void executeCommand(Command* command) {
-        if (command == nullptr) {
-            return;
-        }
+    void executeCommand(const Command& command) {
         bool accepted = false;
-        switch (command->type) {
+        switch (command.type) {
             case CommandType::StartListening:
-                accepted = client_.startListening(command->listening_mode);
+                accepted = client_.startListening(command.listening_mode);
                 break;
             case CommandType::ToggleChat:
                 accepted = client_.toggleChat();
@@ -870,23 +1203,24 @@ private:
                 accepted = client_.closeSession();
                 break;
             case CommandType::SendMcp:
-                accepted = client_.sendMcp(command->payload);
+                accepted = client_.sendMcp(
+                    mcp_command_pool_.at(command.payload_slot).payload);
                 break;
         }
         ++commands_executed_;
         if (!accepted) {
             ++commands_rejected_;
         }
-        delete command;
+        releaseCommandPayload(command);
     }
 
     void discardCommands() {
         if (command_queue_ == nullptr) {
             return;
         }
-        Command* command = nullptr;
+        Command command;
         while (xQueueReceive(command_queue_, &command, 0) == pdTRUE) {
-            delete command;
+            releaseCommandPayload(command);
         }
     }
 
@@ -894,9 +1228,9 @@ private:
         if (callback_queue_ == nullptr) {
             return;
         }
-        CallbackMessage* message = nullptr;
+        CallbackMessage message;
         while (xQueueReceive(callback_queue_, &message, 0) == pdTRUE) {
-            delete message;
+            releaseCallbackPayload(message);
         }
     }
 
@@ -926,6 +1260,12 @@ private:
             vSemaphoreDelete(stopped_signal_);
             stopped_signal_ = nullptr;
         }
+        mcp_command_pool_.reset();
+        wake_callback_pool_.reset();
+        event_callback_pool_.reset();
+        audio_callback_pool_.reset();
+        error_callback_pool_.reset();
+        wake_word_scratch_.clear();
         ready_.store(false);
         session_ready_.store(false);
         pending_urgent_controls_.store(0);
@@ -957,6 +1297,18 @@ private:
         urgent_controls_executed_.store(0);
         urgent_controls_coalesced_.store(0);
         urgent_controls_rejected_.store(0);
+        command_pool_exhausted_.store(0);
+        callback_pool_exhausted_.store(0);
+        state_callbacks_dropped_.store(0);
+        wake_callbacks_dropped_.store(0);
+        event_callbacks_dropped_.store(0);
+        audio_callbacks_dropped_.store(0);
+        capture_callbacks_dropped_.store(0);
+        error_callbacks_dropped_.store(0);
+        command_payloads_in_use_.store(0);
+        callback_payloads_in_use_.store(0);
+        command_payload_pool_high_watermark_.store(0);
+        callback_payload_pool_high_watermark_.store(0);
         speaking_started_ms_ = 0;
         first_downlink_audio_ms_ = 0;
         last_downlink_audio_ms_ = 0;

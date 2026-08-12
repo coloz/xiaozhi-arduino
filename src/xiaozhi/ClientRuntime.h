@@ -51,6 +51,20 @@ struct ClientRuntimeConfig {
     uint8_t command_queue_depth = 8;
     uint8_t callback_queue_depth = 12;
     uint8_t maximum_commands_per_cycle = 4;
+    // Large payloads use separate fixed pools so small control/state messages
+    // never reserve maximum JSON or Opus storage in every queue slot.
+    uint8_t mcp_command_pool_depth = 2;
+    uint8_t event_callback_pool_depth = 4;
+    uint8_t audio_callback_pool_depth = 2;
+    uint8_t error_callback_pool_depth = 2;
+    uint8_t wake_callback_pool_depth = 2;
+    size_t maximum_mcp_payload_bytes = 4096;
+    size_t maximum_event_text_bytes = 1024;
+    size_t maximum_event_status_bytes = 128;
+    size_t maximum_event_emotion_bytes = 64;
+    size_t maximum_event_json_bytes = 2048;
+    size_t maximum_audio_callback_bytes = 4096;
+    size_t maximum_error_message_bytes = 512;
     ClientRuntimeLifecycleHooks lifecycle;
     ClientRuntimePlaybackWatchdogConfig playback_watchdog;
 };
@@ -78,6 +92,16 @@ struct ClientRuntimeStats {
     uint32_t urgent_controls_executed = 0;
     uint32_t urgent_controls_coalesced = 0;
     uint32_t urgent_controls_rejected = 0;
+    uint32_t command_pool_exhausted = 0;
+    uint32_t callback_pool_exhausted = 0;
+    uint32_t state_callbacks_dropped = 0;
+    uint32_t wake_callbacks_dropped = 0;
+    uint32_t event_callbacks_dropped = 0;
+    uint32_t audio_callbacks_dropped = 0;
+    uint32_t capture_callbacks_dropped = 0;
+    uint32_t error_callbacks_dropped = 0;
+    uint8_t command_payload_pool_high_watermark = 0;
+    uint8_t callback_payload_pool_high_watermark = 0;
     uint8_t command_queue_high_watermark = 0;
     uint8_t callback_queue_high_watermark = 0;
 };
@@ -96,6 +120,8 @@ public:
     bool begin(const ClientConfig& client_config, Callbacks callbacks = {},
                const ClientRuntimeConfig& runtime_config = {});
     // Waits for the service task to leave Client::loop() and complete teardown.
+    // Calling end() reentrantly from a callback returns false; retry after
+    // ClientRuntime::loop() returns so its borrowed payload slot remains valid.
     // UINT32_MAX waits indefinitely. A timeout leaves the runtime active so the
     // caller may retry safely without freeing objects still used by the task.
     bool end(uint32_t timeout_ms = 5000);
