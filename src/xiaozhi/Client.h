@@ -45,6 +45,9 @@ public:
     const AudioFormat& serverAudioFormat() const { return server_audio_format_; }
     ListeningMode listeningMode() const { return listening_mode_; }
     const ClientConfig& config() const { return config_; }
+    // Runtime owner-task observability for playback watchdogs. These methods
+    // must follow the same single-task rule as the other Client APIs.
+    bool playbackIdle() const;
 
     McpServer& mcp() { return mcp_server_; }
     const McpServer& mcp() const { return mcp_server_; }

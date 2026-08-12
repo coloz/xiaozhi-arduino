@@ -134,13 +134,11 @@ std::string roleLine = "system";
 std::string messageLine = "Xiaozhi Arduino";
 bool displayDirty = true;
 uint32_t lastDrawMs = 0;
-uint32_t lastSpeakingAudioMs = 0;
 bool chatButtonReading = HIGH;
 bool chatButtonStableState = HIGH;
 uint32_t chatButtonChangedMs = 0;
 
 constexpr uint32_t kChatButtonDebounceMs = 40;
-constexpr uint32_t kSpeakingSilenceTimeoutMs = 12000;
 
 bool hasPlaceholderNetworkConfig() {
   return strcmp(kWifiSsid, "YOUR_WIFI_SSID") == 0 ||
@@ -496,18 +494,8 @@ void setup() {
     statusLine = xiaozhi::stateName(next);
     displayDirty = true;
     Serial.printf("[xiaozhi] state=%s\n", xiaozhi::stateName(next));
-    if (next == xiaozhi::State::Listening) {
-      lastSpeakingAudioMs = 0;
-    } else if (next == xiaozhi::State::Speaking) {
-      lastSpeakingAudioMs = millis();
-    } else if (next == xiaozhi::State::Idle) {
-      lastSpeakingAudioMs = 0;
-    }
   };
   callbacks.on_event = onEvent;
-  callbacks.on_audio = [](const xiaozhi::AudioFrame&) {
-    lastSpeakingAudioMs = millis();
-  };
   callbacks.on_capture = [](bool enabled, const xiaozhi::AudioFormat& format) {
     Serial.printf("[xiaozhi] capture=%s format=%lu Hz/%u ch/%u ms\n",
                   enabled ? "on" : "off", static_cast<unsigned long>(format.sample_rate),
@@ -551,14 +539,6 @@ void loop() {
   runtime.loop();
   pollDialogueTriggers();
   const uint32_t now = millis();
-  if (runtime.ready() && runtime.state() == xiaozhi::State::Speaking &&
-      lastSpeakingAudioMs != 0 &&
-      now - lastSpeakingAudioMs >= kSpeakingSilenceTimeoutMs &&
-      audioPort.playbackIdle()) {
-    Serial.println("[xiaozhi] speaking watchdog: no TTS audio, closing stale session");
-    lastSpeakingAudioMs = 0;
-    runtime.requestCloseSession();
-  }
   if (displayDirty && now - lastDrawMs >= 50) {
     displayDirty = false;
     lastDrawMs = now;

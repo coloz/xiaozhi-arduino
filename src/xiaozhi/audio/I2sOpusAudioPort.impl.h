@@ -2695,7 +2695,9 @@ struct I2sOpusAudioPort::Impl {
       return true;
     }
     bool drained = false;
-    if (xSemaphoreTake(queueMutex, portMAX_DELAY) == pdTRUE) {
+    // Runtime calls this from its owner task. Never let audio worker contention
+    // block protocol servicing; a busy mutex conservatively means not idle.
+    if (xSemaphoreTake(queueMutex, 0) == pdTRUE) {
       drained = decodeQueue.empty() && playbackQueue.empty() &&
                 !decodeInFlight && !outputInFlight;
       xSemaphoreGive(queueMutex);

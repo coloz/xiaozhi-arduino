@@ -68,8 +68,10 @@ public:
     // new TTS generation. Implementations should be idempotent and non-blocking
     // apart from the short synchronization needed to invalidate old work.
     virtual void cancelPlayback() {}
-    // Return false while decoded audio is still queued or playing. Auto/realtime listening
-    // waits for this signal before reopening capture, which reduces tail echo.
+    // Return false while decoded audio is still queued or playing. This query
+    // runs on the Client owner task and must not block; conservatively return
+    // false when worker state cannot be sampled immediately. Auto/realtime
+    // listening waits for this signal before reopening capture.
     virtual bool playbackIdle() const { return true; }
     // Best-effort observability for UI/diagnostics; zero is valid for ports that
     // do not expose their queue depth.

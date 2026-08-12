@@ -182,6 +182,8 @@ void loop() {
 
 默认 Runtime 使用 8192 字节栈、优先级 2、固定到 core 0；活动会话每 2 ms 服务一次，空闲时降到 20 ms，命令仍会立即唤醒任务。可通过 `ClientRuntimeConfig` 调整。双核 Arduino 通常把 `loopTask` 放在 core 1，因此默认值能隔离大多数用户代码；单核芯片的有效 core 仍是 0。回调消息按需分配，设置 `on_audio` 会为了跨任务派发复制 Opus payload；已经挂接 `EncodedAudioPort` 且不需要观察原始下行包时，省略 `on_audio` 可减少热路径分配。
 
+Runtime 默认还会监控 TTS 播放：进入 `Speaking` 后 12 秒未收到首包，或最后一包后 12 秒仍未继续且播放端已空闲，会在服务任务中直接关闭过期会话；该判断不依赖 Arduino `loop()` 或 UI 回调。可用 `ClientRuntimeConfig::playback_watchdog` 调整两个超时或禁用，并通过 `runtime.stats()` 查看首包/包间超时次数和播放忙闲。
+
 更推荐实现 `EncodedAudioPort` 并在 `runtime.begin()` 前调用 `client.attachAudioPort(&port)`，让音频扩展处理 Opus 编解码和硬件队列。未使用音频端口的高级用法可直接用 `Client` 的同步 API 管理手工上行帧。
 
 `EncodedAudioPort` 还提供可选的移动播放、`cancelPlayback()` 和 `queuedPlaybackMs()` 钩子；旧扩展无需修改即可继续编译。实现取消钩子后，用户打断、TTS 新轮次、会话关闭或网络断开会立即废弃旧播放数据，避免缓冲语音继续播出。

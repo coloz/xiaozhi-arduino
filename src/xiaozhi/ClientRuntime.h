@@ -25,6 +25,15 @@ struct ClientRuntimeLifecycleHooks {
     uint32_t maximum_execution_us = 5000;
 };
 
+// Detects a stalled TTS turn on the Runtime service task. A timeout is armed
+// when Speaking begins, re-armed by each accepted downlink audio packet, and
+// closes the stale session only after the playback port reports idle.
+struct ClientRuntimePlaybackWatchdogConfig {
+    bool enabled = true;
+    uint32_t first_audio_timeout_ms = 12000;
+    uint32_t inter_packet_timeout_ms = 12000;
+};
+
 // Runs the single-task Client API on a dedicated FreeRTOS task. This keeps
 // WebSocket polling, audio uplink, and protocol timeouts independent from a
 // slow Arduino loop(). User callbacks are queued and dispatched by loop(), so
@@ -43,6 +52,7 @@ struct ClientRuntimeConfig {
     uint8_t callback_queue_depth = 12;
     uint8_t maximum_commands_per_cycle = 4;
     ClientRuntimeLifecycleHooks lifecycle;
+    ClientRuntimePlaybackWatchdogConfig playback_watchdog;
 };
 
 struct ClientRuntimeStats {
@@ -60,6 +70,10 @@ struct ClientRuntimeStats {
     uint32_t lifecycle_hook_calls = 0;
     uint32_t lifecycle_hook_overruns = 0;
     uint32_t lifecycle_hook_maximum_us = 0;
+    uint32_t playback_first_audio_timeouts = 0;
+    uint32_t playback_inter_packet_timeouts = 0;
+    uint32_t playback_timeout_close_failures = 0;
+    bool playback_idle = true;
     uint8_t command_queue_high_watermark = 0;
     uint8_t callback_queue_high_watermark = 0;
 };

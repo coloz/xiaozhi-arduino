@@ -537,6 +537,11 @@ bool Client::attachAudioPort(EncodedAudioPort* audio_port) {
     return true;
 }
 
+bool Client::playbackIdle() const {
+    return !audio_port_started_ || audio_port_ == nullptr ||
+           audio_port_->playbackIdle();
+}
+
 bool Client::attachRealtimeControlSink(RealtimeControlSink* sink) {
     DispatchScope dispatch(*this);
     if (user_callback_depth_ != 0 || end_requested_ || begun_) {

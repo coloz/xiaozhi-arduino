@@ -43,6 +43,10 @@ void updateMaximum(std::atomic<uint32_t>& maximum, uint32_t value) {
     }
 }
 
+uint32_t runtimeNowMs() {
+    return static_cast<uint32_t>(esp_timer_get_time() / 1000);
+}
+
 }  // namespace
 
 class ClientRuntime::Impl final : public RealtimeControlSink {
@@ -240,6 +244,13 @@ public:
         output.lifecycle_hook_calls = lifecycle_hook_calls_.load();
         output.lifecycle_hook_overruns = lifecycle_hook_overruns_.load();
         output.lifecycle_hook_maximum_us = lifecycle_hook_maximum_us_.load();
+        output.playback_first_audio_timeouts =
+            playback_first_audio_timeouts_.load();
+        output.playback_inter_packet_timeouts =
+            playback_inter_packet_timeouts_.load();
+        output.playback_timeout_close_failures =
+            playback_timeout_close_failures_.load();
+        output.playback_idle = playback_idle_.load();
         output.command_queue_high_watermark = command_queue_high_watermark_.load();
         output.callback_queue_high_watermark = callback_queue_high_watermark_.load();
         return output;
@@ -322,8 +333,20 @@ private:
     std::atomic<uint32_t> lifecycle_hook_calls_{0};
     std::atomic<uint32_t> lifecycle_hook_overruns_{0};
     std::atomic<uint32_t> lifecycle_hook_maximum_us_{0};
+    std::atomic<uint32_t> playback_first_audio_timeouts_{0};
+    std::atomic<uint32_t> playback_inter_packet_timeouts_{0};
+    std::atomic<uint32_t> playback_timeout_close_failures_{0};
+    std::atomic<bool> playback_idle_{true};
     std::atomic<uint8_t> command_queue_high_watermark_{0};
     std::atomic<uint8_t> callback_queue_high_watermark_{0};
+
+    // Owned exclusively by the Runtime service task. uint32_t subtraction is
+    // intentionally wrap-safe across the Arduino millisecond counter rollover.
+    uint32_t speaking_started_ms_ = 0;
+    uint32_t first_downlink_audio_ms_ = 0;
+    uint32_t last_downlink_audio_ms_ = 0;
+    bool playback_watchdog_armed_ = false;
+    bool received_downlink_audio_ = false;
 
     static void serviceTaskEntry(void* argument) {
         static_cast<Impl*>(argument)->serviceTask();
@@ -338,6 +361,11 @@ private:
                config.idle_poll_interval_ms <= 1000 &&
                config.command_queue_depth > 0 && config.callback_queue_depth > 0 &&
                config.maximum_commands_per_cycle > 0 &&
+               (!config.playback_watchdog.enabled ||
+                (config.playback_watchdog.first_audio_timeout_ms > 0 &&
+                 config.playback_watchdog.first_audio_timeout_ms <= 3600000 &&
+                 config.playback_watchdog.inter_packet_timeout_ms > 0 &&
+                 config.playback_watchdog.inter_packet_timeout_ms <= 3600000)) &&
                (config.lifecycle.on_state_changed == nullptr ||
                 (config.lifecycle.maximum_execution_us > 0 &&
                  config.lifecycle.maximum_execution_us <= 1000000));
@@ -346,8 +374,10 @@ private:
     Callbacks makeDeferredCallbacks() {
         Callbacks callbacks;
         if (user_callbacks_.on_state_changed ||
+            runtime_config_.playback_watchdog.enabled ||
             runtime_config_.lifecycle.on_state_changed != nullptr) {
             callbacks.on_state_changed = [this](State old_state, State new_state) {
+                updatePlaybackState(old_state, new_state);
                 runLifecycleHook(old_state, new_state);
                 // Publish the new state only after its internal lifecycle work
                 // has completed, so readers cannot observe a half-applied state.
@@ -372,8 +402,12 @@ private:
                 enqueueCallback(message);
             };
         }
-        if (user_callbacks_.on_audio) {
+        if (user_callbacks_.on_audio || runtime_config_.playback_watchdog.enabled) {
             callbacks.on_audio = [this](const AudioFrame& audio) {
+                noteDownlinkAudio();
+                if (!user_callbacks_.on_audio) {
+                    return;
+                }
                 // Audio callbacks are observers; attached EncodedAudioPort
                 // playback is delivered directly by Client. Avoid allocating
                 // and copying Opus when a stalled user loop has filled its
@@ -431,6 +465,81 @@ private:
         }
     }
 
+    void updatePlaybackState(State, State new_state) {
+        if (!runtime_config_.playback_watchdog.enabled) {
+            return;
+        }
+        if (new_state == State::Speaking) {
+            speaking_started_ms_ = runtimeNowMs();
+            first_downlink_audio_ms_ = 0;
+            last_downlink_audio_ms_ = 0;
+            received_downlink_audio_ = false;
+            playback_watchdog_armed_ = true;
+            refreshPlaybackSnapshot();
+            return;
+        }
+        playback_watchdog_armed_ = false;
+        received_downlink_audio_ = false;
+        speaking_started_ms_ = 0;
+        first_downlink_audio_ms_ = 0;
+        last_downlink_audio_ms_ = 0;
+        refreshPlaybackSnapshot();
+    }
+
+    void noteDownlinkAudio() {
+        if (!runtime_config_.playback_watchdog.enabled ||
+            client_.state() != State::Speaking || !playback_watchdog_armed_) {
+            return;
+        }
+        const uint32_t now_ms = runtimeNowMs();
+        if (!received_downlink_audio_) {
+            first_downlink_audio_ms_ = now_ms;
+            received_downlink_audio_ = true;
+        }
+        last_downlink_audio_ms_ = now_ms;
+    }
+
+    void refreshPlaybackSnapshot() {
+        playback_idle_.store(client_.playbackIdle());
+    }
+
+    void servicePlaybackWatchdog() {
+        if (!runtime_config_.playback_watchdog.enabled ||
+            !playback_watchdog_armed_ || client_.state() != State::Speaking) {
+            return;
+        }
+        const uint32_t now_ms = runtimeNowMs();
+        const uint32_t reference_ms = received_downlink_audio_
+                                          ? last_downlink_audio_ms_
+                                          : speaking_started_ms_;
+        const uint32_t timeout_ms =
+            received_downlink_audio_
+                ? runtime_config_.playback_watchdog.inter_packet_timeout_ms
+                : runtime_config_.playback_watchdog.first_audio_timeout_ms;
+        if (now_ms - reference_ms < timeout_ms) {
+            return;
+        }
+        // Sampling is deferred until the deadline so the normal 2 ms service
+        // loop does not contend with audio workers on every cycle.
+        refreshPlaybackSnapshot();
+        if (!playback_idle_.load()) {
+            return;
+        }
+
+        // Disarm before acting because closeSession() synchronously emits the
+        // state result. This owner-task path runs ahead of ordinary commands.
+        playback_watchdog_armed_ = false;
+        if (received_downlink_audio_) {
+            ++playback_inter_packet_timeouts_;
+        } else {
+            ++playback_first_audio_timeouts_;
+        }
+        if (!client_.closeSession()) {
+            ++playback_timeout_close_failures_;
+        }
+        snapshotClient();
+    }
+
     void serviceTask() {
         const bool sink_attached = client_.attachRealtimeControlSink(this);
         const bool begun = sink_attached &&
@@ -442,6 +551,7 @@ private:
 
         if (begun) {
             while (!stop_requested_.load()) {
+                servicePlaybackWatchdog();
                 processWakeEvents();
                 processCommands();
                 if (stop_requested_.load()) {
@@ -743,6 +853,15 @@ private:
         lifecycle_hook_calls_.store(0);
         lifecycle_hook_overruns_.store(0);
         lifecycle_hook_maximum_us_.store(0);
+        playback_first_audio_timeouts_.store(0);
+        playback_inter_packet_timeouts_.store(0);
+        playback_timeout_close_failures_.store(0);
+        playback_idle_.store(true);
+        speaking_started_ms_ = 0;
+        first_downlink_audio_ms_ = 0;
+        last_downlink_audio_ms_ = 0;
+        playback_watchdog_armed_ = false;
+        received_downlink_audio_ = false;
         command_queue_high_watermark_.store(0);
         callback_queue_high_watermark_.store(0);
     }

@@ -123,7 +123,6 @@ constexpr char kWifiPassword[] = XIAOZHI_WIFI_PASSWORD;
 
 constexpr uint16_t kExpressionTransitionMs = 600;
 constexpr uint32_t kChatButtonDebounceMs = 40;
-constexpr uint32_t kSpeakingSilenceTimeoutMs = 12000;
 
 std::string pendingEmotionName = "neutral";
 std::string currentEmotionName = "neutral";
@@ -140,7 +139,6 @@ uint32_t nextDemoEmotionMs = 0;
 uint32_t activationRefreshAtMs = 0;
 uint32_t lastActivationCountdownSec = 0xFFFFFFFFUL;
 uint32_t lastHeartbeatMs = 0;
-uint32_t lastSpeakingAudioMs = 0;
 bool chatButtonReading = HIGH;
 bool chatButtonStableState = HIGH;
 uint32_t chatButtonChangedMs = 0;
@@ -455,17 +453,10 @@ void setup() {
   callbacks.on_state_changed = [](xiaozhi::State, xiaozhi::State next) {
     Serial.printf("[xiaozhi] state=%s\n", xiaozhi::stateName(next));
     if (next == xiaozhi::State::Listening) {
-      lastSpeakingAudioMs = 0;
       queueLocalEmotion("thinking");
-    } else if (next == xiaozhi::State::Speaking) {
-      lastSpeakingAudioMs = millis();
     } else if (next == xiaozhi::State::Idle) {
-      lastSpeakingAudioMs = 0;
       queueLocalEmotion("neutral");
     }
-  };
-  callbacks.on_audio = [](const xiaozhi::AudioFrame&) {
-    lastSpeakingAudioMs = millis();
   };
   callbacks.on_capture = [](bool enabled, const xiaozhi::AudioFormat& format) {
     Serial.printf("[xiaozhi] capture=%s format=%lu Hz/%u ch/%u ms\n",
@@ -545,16 +536,6 @@ void loop() {
   }
 
   const uint32_t now = millis();
-  if (clientStarted && runtime.ready() &&
-      runtime.state() == xiaozhi::State::Speaking &&
-      lastSpeakingAudioMs != 0 &&
-      now - lastSpeakingAudioMs >= kSpeakingSilenceTimeoutMs &&
-      audioPort.playbackIdle()) {
-    Serial.println(
-        "[xiaozhi] speaking watchdog: closing stale session");
-    lastSpeakingAudioMs = 0;
-    runtime.requestCloseSession();
-  }
   if (now - lastHeartbeatMs >= 5000) {
     lastHeartbeatMs = now;
     Serial.printf(
