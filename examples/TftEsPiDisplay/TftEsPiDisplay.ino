@@ -334,16 +334,6 @@ void toggleDialogue(const char* source) {
 }
 
 void pollDialogueTriggers() {
-  std::string wakeWord;
-  if (audioPort.consumeWakeWord(wakeWord)) {
-    Serial.printf("[wake] detected: %s\n", wakeWord.c_str());
-    if (!runtime.ready() || runtime.state() != xiaozhi::State::Idle ||
-        !runtime.requestWakeWordDetected(wakeWord)) {
-      Serial.printf("[wake] could not enter dialogue from state=%s\n",
-                    runtime.stateName());
-    }
-  }
-
   while (Serial.available() > 0) {
     const char command = static_cast<char>(Serial.read());
     if (command == 't' || command == 'T') {
@@ -499,6 +489,9 @@ void setup() {
   transport.setCACertificate(xiaozhi::ArduinoOfficialService::rootCACertificate());
 
   xiaozhi::Callbacks callbacks;
+  callbacks.on_wake_word = [](const std::string& wakeWord) {
+    Serial.printf("[wake] detected: %s\n", wakeWord.c_str());
+  };
   callbacks.on_state_changed = [](xiaozhi::State, xiaozhi::State next) {
     statusLine = xiaozhi::stateName(next);
     displayDirty = true;

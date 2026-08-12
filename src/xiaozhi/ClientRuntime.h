@@ -37,6 +37,10 @@ struct ClientRuntimeStats {
     uint32_t callbacks_queued = 0;
     uint32_t callbacks_dispatched = 0;
     uint32_t callbacks_dropped = 0;
+    uint32_t wake_events_queued = 0;
+    uint32_t wake_events_executed = 0;
+    uint32_t wake_events_coalesced = 0;
+    uint32_t wake_events_rejected = 0;
     uint8_t command_queue_high_watermark = 0;
     uint8_t callback_queue_high_watermark = 0;
 };

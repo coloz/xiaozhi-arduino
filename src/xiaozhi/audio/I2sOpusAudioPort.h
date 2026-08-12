@@ -371,9 +371,9 @@ class I2sOpusAudioPort final : public xiaozhi::EncodedAudioPort {
   void cancelPlayback() override;
   bool playbackIdle() const override;
   uint32_t queuedPlaybackMs() const override;
+  void setRealtimeControlSink(xiaozhi::RealtimeControlSink* sink) override;
 
-  // Wake-word events are consumed from the Arduino loop so Client APIs are
-  // never called by the speech-recognition task.
+  // Legacy polling fallback for direct Client users without ClientRuntime.
   void setWakeDetectionEnabled(bool enabled);
   bool consumeWakeWord(std::string& wakeWord);
 

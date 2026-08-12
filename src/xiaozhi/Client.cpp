@@ -527,7 +527,25 @@ bool Client::attachAudioPort(EncodedAudioPort* audio_port) {
         reportError(ErrorCode::InvalidState, "attachAudioPort must be called before begin");
         return false;
     }
+    if (audio_port_ != nullptr && audio_port_ != audio_port) {
+        audio_port_->setRealtimeControlSink(nullptr);
+    }
     audio_port_ = audio_port;
+    if (audio_port_ != nullptr) {
+        audio_port_->setRealtimeControlSink(realtime_control_sink_);
+    }
+    return true;
+}
+
+bool Client::attachRealtimeControlSink(RealtimeControlSink* sink) {
+    DispatchScope dispatch(*this);
+    if (user_callback_depth_ != 0 || end_requested_ || begun_) {
+        return false;
+    }
+    realtime_control_sink_ = sink;
+    if (audio_port_ != nullptr) {
+        audio_port_->setRealtimeControlSink(sink);
+    }
     return true;
 }
 

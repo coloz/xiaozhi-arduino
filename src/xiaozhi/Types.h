@@ -113,6 +113,9 @@ struct Callbacks {
     std::function<void(const AudioFrame& frame)> on_audio;
     std::function<void(bool enabled, const AudioFormat& format)> on_capture;
     std::function<void(ErrorCode code, const std::string& message)> on_error;
+    // Kept after the original fields so existing aggregate initialization remains valid.
+    // ClientRuntime dispatches this local observer after realtime wake control is accepted.
+    std::function<void(const std::string& wake_word)> on_wake_word;
 };
 
 inline const char* stateName(State state) {

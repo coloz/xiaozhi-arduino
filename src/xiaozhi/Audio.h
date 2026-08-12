@@ -9,6 +9,18 @@
 
 namespace xiaozhi {
 
+// Allocation-free control boundary for audio workers and ISR-backed producers.
+// Implementations must copy wake_word before returning; the pointer is borrowed
+// only for the duration of the call.
+class RealtimeControlSink {
+public:
+    static constexpr size_t kMaximumWakeWordBytes = 95;
+
+    virtual ~RealtimeControlSink() = default;
+    virtual bool notifyWakeWordDetected(const char* wake_word, size_t size,
+                                        bool from_isr = false) = 0;
+};
+
 // Hardware PCM interface. Board packages can implement this with ESP_I2S or a codec library.
 class AudioIo {
 public:
@@ -62,6 +74,10 @@ public:
     // Best-effort observability for UI/diagnostics; zero is valid for ports that
     // do not expose their queue depth.
     virtual uint32_t queuedPlaybackMs() const { return 0; }
+    // Runtime installs this before begin() and removes it after end(). Audio
+    // workers should publish fixed-size control events here instead of waiting
+    // for the Arduino loop to poll them.
+    virtual void setRealtimeControlSink(RealtimeControlSink* sink) { (void)sink; }
 };
 
 }  // namespace xiaozhi

@@ -49,6 +49,9 @@ public:
     McpServer& mcp() { return mcp_server_; }
     const McpServer& mcp() const { return mcp_server_; }
     bool attachAudioPort(EncodedAudioPort* audio_port);
+    // Runtime-only control attachment. Configure it before begin() and clear it
+    // after end(); application code normally never needs to call this directly.
+    bool attachRealtimeControlSink(RealtimeControlSink* sink);
 
 private:
     enum class DeferredTextRequirement : uint8_t {
@@ -104,6 +107,7 @@ private:
     std::string session_id_;
     std::string pending_wake_word_;
     EncodedAudioPort* audio_port_ = nullptr;
+    RealtimeControlSink* realtime_control_sink_ = nullptr;
     bool audio_port_started_ = false;
     bool pending_listening_start_ = false;
     bool downlink_suppressed_ = false;

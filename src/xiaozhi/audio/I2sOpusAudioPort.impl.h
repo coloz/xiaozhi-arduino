@@ -364,6 +364,7 @@ struct I2sOpusAudioPort::Impl {
   std::atomic<uint32_t> wakeGeneration{1};
   std::atomic<bool> wakeDetected{false};
   std::atomic<uint32_t> wakeDetectedGeneration{0};
+  std::atomic<xiaozhi::RealtimeControlSink*> realtimeControlSink{nullptr};
   std::atomic<bool> wakeTaskRunning{false};
   std::atomic<bool> wakeTaskExited{true};
   TaskHandle_t wakeTask = nullptr;
@@ -1316,6 +1317,23 @@ struct I2sOpusAudioPort::Impl {
         portEXIT_CRITICAL(&wakeStateMux);
         if (!committed) {
           continue;
+        }
+        xiaozhi::RealtimeControlSink* sink =
+            realtimeControlSink.load(std::memory_order_acquire);
+        if (sink != nullptr) {
+          size_t wordSize = 0;
+          while (wordSize < sizeof(lastWakeWord) && lastWakeWord[wordSize] != '\0') {
+            ++wordSize;
+          }
+          if (sink->notifyWakeWordDetected(lastWakeWord, wordSize)) {
+            portENTER_CRITICAL(&wakeStateMux);
+            if (wakeDetected.load() &&
+                wakeDetectedGeneration.load() == generation) {
+              wakeDetected.store(false);
+              wakeDetectedGeneration.store(0);
+            }
+            portEXIT_CRITICAL(&wakeStateMux);
+          }
         }
         wakePcm.clear();
         break;
@@ -2885,6 +2903,13 @@ uint32_t I2sOpusAudioPort::queuedPlaybackMs() const {
   return impl_ == nullptr || !impl_->started
              ? 0
              : impl_->queuedPlaybackDurationMs();
+}
+
+void I2sOpusAudioPort::setRealtimeControlSink(
+    xiaozhi::RealtimeControlSink* sink) {
+  if (impl_ != nullptr) {
+    impl_->realtimeControlSink.store(sink, std::memory_order_release);
+  }
 }
 
 void I2sOpusAudioPort::setWakeDetectionEnabled(bool enabled) {

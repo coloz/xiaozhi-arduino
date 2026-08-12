@@ -36,7 +36,7 @@ void updateHighWatermark(std::atomic<uint8_t>& maximum, T value) {
 
 }  // namespace
 
-class ClientRuntime::Impl {
+class ClientRuntime::Impl final : public RealtimeControlSink {
 public:
     explicit Impl(Client& client) : client_(client), state_(client.state()) {}
 
@@ -64,10 +64,12 @@ public:
                                       sizeof(Command*));
         callback_queue_ = xQueueCreate(runtime_config_.callback_queue_depth,
                                        sizeof(CallbackMessage*));
+        wake_event_queue_ = xQueueCreate(1, sizeof(WakeEvent));
         startup_signal_ = xSemaphoreCreateBinary();
         stopped_signal_ = xSemaphoreCreateBinary();
         if (command_queue_ == nullptr || callback_queue_ == nullptr ||
-            startup_signal_ == nullptr || stopped_signal_ == nullptr) {
+            wake_event_queue_ == nullptr || startup_signal_ == nullptr ||
+            stopped_signal_ == nullptr) {
             releaseResources();
             return false;
         }
@@ -174,6 +176,40 @@ public:
         return enqueueCommand(command);
     }
 
+    bool notifyWakeWordDetected(const char* wake_word, size_t size,
+                                bool from_isr) override {
+        if (wake_word == nullptr || size == 0 ||
+            size > RealtimeControlSink::kMaximumWakeWordBytes ||
+            wake_event_queue_ == nullptr || !running_.load() ||
+            stop_requested_.load()) {
+            ++wake_events_rejected_;
+            return false;
+        }
+        WakeEvent event;
+        event.size = static_cast<uint8_t>(size);
+        std::copy_n(wake_word, size, event.text);
+        event.text[size] = '\0';
+        BaseType_t queued = pdFALSE;
+        if (from_isr) {
+            BaseType_t higher_priority_task_woken = pdFALSE;
+            queued = xQueueSendFromISR(wake_event_queue_, &event,
+                                       &higher_priority_task_woken);
+            if (higher_priority_task_woken == pdTRUE) {
+                portYIELD_FROM_ISR();
+            }
+        } else {
+            queued = xQueueSend(wake_event_queue_, &event, 0);
+        }
+        if (queued != pdTRUE) {
+            // One pending wake is sufficient: WakeNet disables its generation
+            // after detection, and duplicate producers must not queue storms.
+            ++wake_events_coalesced_;
+            return true;
+        }
+        ++wake_events_queued_;
+        return true;
+    }
+
     bool running() const { return running_.load(); }
     bool ready() const { return ready_.load(); }
     bool sessionReady() const { return session_ready_.load(); }
@@ -188,6 +224,10 @@ public:
         output.callbacks_queued = callbacks_queued_.load();
         output.callbacks_dispatched = callbacks_dispatched_.load();
         output.callbacks_dropped = callbacks_dropped_.load();
+        output.wake_events_queued = wake_events_queued_.load();
+        output.wake_events_executed = wake_events_executed_.load();
+        output.wake_events_coalesced = wake_events_coalesced_.load();
+        output.wake_events_rejected = wake_events_rejected_.load();
         output.command_queue_high_watermark = command_queue_high_watermark_.load();
         output.callback_queue_high_watermark = callback_queue_high_watermark_.load();
         return output;
@@ -212,8 +252,14 @@ private:
         std::string payload;
     };
 
+    struct WakeEvent {
+        uint8_t size = 0;
+        char text[RealtimeControlSink::kMaximumWakeWordBytes + 1]{};
+    };
+
     enum class CallbackType : uint8_t {
         StateChanged,
+        WakeWord,
         Event,
         Audio,
         Capture,
@@ -225,6 +271,7 @@ private:
         CallbackType type;
         State old_state = State::Unknown;
         State new_state = State::Unknown;
+        std::string wake_word;
         Event event;
         AudioFrame audio;
         bool capture_enabled = false;
@@ -239,6 +286,7 @@ private:
     Callbacks user_callbacks_;
     QueueHandle_t command_queue_ = nullptr;
     QueueHandle_t callback_queue_ = nullptr;
+    QueueHandle_t wake_event_queue_ = nullptr;
     SemaphoreHandle_t startup_signal_ = nullptr;
     SemaphoreHandle_t stopped_signal_ = nullptr;
     std::atomic<bool> task_active_{false};
@@ -255,6 +303,10 @@ private:
     std::atomic<uint32_t> callbacks_queued_{0};
     std::atomic<uint32_t> callbacks_dispatched_{0};
     std::atomic<uint32_t> callbacks_dropped_{0};
+    std::atomic<uint32_t> wake_events_queued_{0};
+    std::atomic<uint32_t> wake_events_executed_{0};
+    std::atomic<uint32_t> wake_events_coalesced_{0};
+    std::atomic<uint32_t> wake_events_rejected_{0};
     std::atomic<uint8_t> command_queue_high_watermark_{0};
     std::atomic<uint8_t> callback_queue_high_watermark_{0};
 
@@ -337,7 +389,9 @@ private:
     }
 
     void serviceTask() {
-        const bool begun = client_.begin(client_config_, makeDeferredCallbacks());
+        const bool sink_attached = client_.attachRealtimeControlSink(this);
+        const bool begun = sink_attached &&
+                           client_.begin(client_config_, makeDeferredCallbacks());
         startup_succeeded_.store(begun);
         running_.store(begun);
         snapshotClient();
@@ -345,6 +399,7 @@ private:
 
         if (begun) {
             while (!stop_requested_.load()) {
+                processWakeEvents();
                 processCommands();
                 if (stop_requested_.load()) {
                     break;
@@ -369,6 +424,10 @@ private:
             client_.end();
         }
 
+        if (sink_attached) {
+            client_.attachRealtimeControlSink(nullptr);
+        }
+
         snapshotClient();
         running_.store(false);
         task_active_.store(false);
@@ -391,6 +450,32 @@ private:
                 return;
             }
         }
+    }
+
+    void processWakeEvents() {
+        if (wake_event_queue_ == nullptr) {
+            return;
+        }
+        WakeEvent event;
+        if (xQueueReceive(wake_event_queue_, &event, 0) != pdTRUE) {
+            return;
+        }
+        const State current = client_.state();
+        if (!client_.ready() ||
+            (current != State::Idle && current != State::Listening &&
+             current != State::Speaking)) {
+            // Connecting and other transient states already represent a wake
+            // in progress; consume duplicates without generating Client errors.
+            ++wake_events_rejected_;
+            return;
+        }
+        std::string wake_word(event.text, event.size);
+        if (!client_.wakeWordDetected(wake_word)) {
+            ++wake_events_rejected_;
+            return;
+        }
+        ++wake_events_executed_;
+        enqueueWakeObserver(std::move(wake_word));
     }
 
     Command* allocateCommand(CommandType type) {
@@ -459,11 +544,27 @@ private:
                             uxQueueMessagesWaiting(callback_queue_));
     }
 
+    void enqueueWakeObserver(std::string wake_word) {
+        if (!user_callbacks_.on_wake_word) {
+            return;
+        }
+        CallbackMessage* message = allocateCallback(CallbackType::WakeWord);
+        if (message != nullptr) {
+            message->wake_word = std::move(wake_word);
+        }
+        enqueueCallback(message);
+    }
+
     void dispatchCallback(const CallbackMessage& message) {
         switch (message.type) {
             case CallbackType::StateChanged:
                 if (user_callbacks_.on_state_changed) {
                     user_callbacks_.on_state_changed(message.old_state, message.new_state);
+                }
+                break;
+            case CallbackType::WakeWord:
+                if (user_callbacks_.on_wake_word) {
+                    user_callbacks_.on_wake_word(message.wake_word);
                 }
                 break;
             case CallbackType::Event:
@@ -516,6 +617,9 @@ private:
                 break;
             case CommandType::WakeWordDetected:
                 accepted = client_.wakeWordDetected(command->payload);
+                if (accepted) {
+                    enqueueWakeObserver(command->payload);
+                }
                 break;
             case CommandType::CloseSession:
                 accepted = client_.closeSession();
@@ -565,6 +669,10 @@ private:
             vQueueDelete(callback_queue_);
             callback_queue_ = nullptr;
         }
+        if (wake_event_queue_ != nullptr) {
+            vQueueDelete(wake_event_queue_);
+            wake_event_queue_ = nullptr;
+        }
         if (startup_signal_ != nullptr) {
             vSemaphoreDelete(startup_signal_);
             startup_signal_ = nullptr;
@@ -585,6 +693,10 @@ private:
         callbacks_queued_.store(0);
         callbacks_dispatched_.store(0);
         callbacks_dropped_.store(0);
+        wake_events_queued_.store(0);
+        wake_events_executed_.store(0);
+        wake_events_coalesced_.store(0);
+        wake_events_rejected_.store(0);
         command_queue_high_watermark_.store(0);
         callback_queue_high_watermark_.store(0);
     }
