@@ -1213,6 +1213,9 @@ void Client::handleStateChange(State old_state, State new_state) {
     if (new_state != State::Listening) {
         pending_listening_start_ = false;
     }
+    if (audio_port_started_ && audio_port_ != nullptr) {
+        audio_port_->onClientStateChanged(old_state, new_state);
+    }
     if (callbacks_.on_state_changed) {
         beginUserCallback();
         callbacks_.on_state_changed(old_state, new_state);

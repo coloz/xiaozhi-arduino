@@ -74,6 +74,13 @@ public:
     // Best-effort observability for UI/diagnostics; zero is valid for ports that
     // do not expose their queue depth.
     virtual uint32_t queuedPlaybackMs() const { return 0; }
+    // Runs synchronously on the Client owner task after core state invariants
+    // are applied and before application observers. It must not block, allocate,
+    // call Client APIs, or perform display work.
+    virtual void onClientStateChanged(State old_state, State new_state) {
+        (void)old_state;
+        (void)new_state;
+    }
     // Runtime installs this before begin() and removes it after end(). Audio
     // workers should publish fixed-size control events here instead of waiting
     // for the Arduino loop to poll them.

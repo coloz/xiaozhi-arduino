@@ -454,11 +454,6 @@ void setup() {
   };
   callbacks.on_state_changed = [](xiaozhi::State, xiaozhi::State next) {
     Serial.printf("[xiaozhi] state=%s\n", xiaozhi::stateName(next));
-    const bool lowLatencySession = next == xiaozhi::State::Connecting ||
-                                   next == xiaozhi::State::Listening ||
-                                   next == xiaozhi::State::Speaking;
-    WiFi.setSleep(!lowLatencySession);
-    audioPort.setWakeDetectionEnabled(next == xiaozhi::State::Idle);
     if (next == xiaozhi::State::Listening) {
       lastSpeakingAudioMs = 0;
       queueLocalEmotion("thinking");
@@ -494,7 +489,16 @@ void setup() {
     Serial.println("[audio] failed to attach I2S/Opus audio port");
     return;
   }
-  if (!runtime.begin(config, callbacks)) {
+  xiaozhi::ClientRuntimeConfig runtimeConfig;
+  runtimeConfig.lifecycle.on_state_changed =
+      [](void*, xiaozhi::State, xiaozhi::State next, bool sessionReady) {
+        const bool lowLatencySession = sessionReady ||
+                                       next == xiaozhi::State::Connecting ||
+                                       next == xiaozhi::State::Listening ||
+                                       next == xiaozhi::State::Speaking;
+        WiFi.setSleep(!lowLatencySession);
+      };
+  if (!runtime.begin(config, callbacks, runtimeConfig)) {
     showSystemScreen("STARTUP ERROR", "AUDIO OR CLIENT FAILED",
                      "CHECK SERIAL LOG");
     return;

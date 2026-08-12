@@ -10,6 +10,21 @@
 
 namespace xiaozhi {
 
+// Internal state-transition hook for bounded hardware policy such as Wi-Fi
+// modem sleep. It runs synchronously on the Runtime service task after Client
+// and its audio port have applied their lifecycle state, and before the UI
+// observer is queued. The hook must not block, allocate, call Client/Runtime,
+// or touch a display. Runtime measures the configured execution-time budget;
+// an overrun is observable but cannot be preempted.
+struct ClientRuntimeLifecycleHooks {
+    using StateChanged = void (*)(void* context, State old_state, State new_state,
+                                  bool session_ready);
+
+    StateChanged on_state_changed = nullptr;
+    void* context = nullptr;
+    uint32_t maximum_execution_us = 5000;
+};
+
 // Runs the single-task Client API on a dedicated FreeRTOS task. This keeps
 // WebSocket polling, audio uplink, and protocol timeouts independent from a
 // slow Arduino loop(). User callbacks are queued and dispatched by loop(), so
@@ -27,6 +42,7 @@ struct ClientRuntimeConfig {
     uint8_t command_queue_depth = 8;
     uint8_t callback_queue_depth = 12;
     uint8_t maximum_commands_per_cycle = 4;
+    ClientRuntimeLifecycleHooks lifecycle;
 };
 
 struct ClientRuntimeStats {
@@ -41,6 +57,9 @@ struct ClientRuntimeStats {
     uint32_t wake_events_executed = 0;
     uint32_t wake_events_coalesced = 0;
     uint32_t wake_events_rejected = 0;
+    uint32_t lifecycle_hook_calls = 0;
+    uint32_t lifecycle_hook_overruns = 0;
+    uint32_t lifecycle_hook_maximum_us = 0;
     uint8_t command_queue_high_watermark = 0;
     uint8_t callback_queue_high_watermark = 0;
 };

@@ -2905,6 +2905,15 @@ uint32_t I2sOpusAudioPort::queuedPlaybackMs() const {
              : impl_->queuedPlaybackDurationMs();
 }
 
+void I2sOpusAudioPort::onClientStateChanged(xiaozhi::State,
+                                            xiaozhi::State newState) {
+  if (impl_ != nullptr && impl_->started) {
+    // WakeNet lifecycle follows Client state on the Client/Runtime owner task;
+    // delayed UI callbacks are observers only.
+    impl_->setWakeDetection(newState == xiaozhi::State::Idle);
+  }
+}
+
 void I2sOpusAudioPort::setRealtimeControlSink(
     xiaozhi::RealtimeControlSink* sink) {
   if (impl_ != nullptr) {

@@ -4,6 +4,7 @@
 #include <freertos/queue.h>
 #include <freertos/semphr.h>
 #include <freertos/task.h>
+#include <esp_timer.h>
 
 #include <algorithm>
 #include <limits>
@@ -30,6 +31,14 @@ void updateHighWatermark(std::atomic<uint8_t>& maximum, T value) {
     uint8_t previous = maximum.load(std::memory_order_relaxed);
     while (bounded > previous &&
            !maximum.compare_exchange_weak(previous, bounded,
+                                          std::memory_order_relaxed)) {
+    }
+}
+
+void updateMaximum(std::atomic<uint32_t>& maximum, uint32_t value) {
+    uint32_t previous = maximum.load(std::memory_order_relaxed);
+    while (value > previous &&
+           !maximum.compare_exchange_weak(previous, value,
                                           std::memory_order_relaxed)) {
     }
 }
@@ -228,6 +237,9 @@ public:
         output.wake_events_executed = wake_events_executed_.load();
         output.wake_events_coalesced = wake_events_coalesced_.load();
         output.wake_events_rejected = wake_events_rejected_.load();
+        output.lifecycle_hook_calls = lifecycle_hook_calls_.load();
+        output.lifecycle_hook_overruns = lifecycle_hook_overruns_.load();
+        output.lifecycle_hook_maximum_us = lifecycle_hook_maximum_us_.load();
         output.command_queue_high_watermark = command_queue_high_watermark_.load();
         output.callback_queue_high_watermark = callback_queue_high_watermark_.load();
         return output;
@@ -307,6 +319,9 @@ private:
     std::atomic<uint32_t> wake_events_executed_{0};
     std::atomic<uint32_t> wake_events_coalesced_{0};
     std::atomic<uint32_t> wake_events_rejected_{0};
+    std::atomic<uint32_t> lifecycle_hook_calls_{0};
+    std::atomic<uint32_t> lifecycle_hook_overruns_{0};
+    std::atomic<uint32_t> lifecycle_hook_maximum_us_{0};
     std::atomic<uint8_t> command_queue_high_watermark_{0};
     std::atomic<uint8_t> callback_queue_high_watermark_{0};
 
@@ -322,20 +337,30 @@ private:
                config.idle_poll_interval_ms > 0 &&
                config.idle_poll_interval_ms <= 1000 &&
                config.command_queue_depth > 0 && config.callback_queue_depth > 0 &&
-               config.maximum_commands_per_cycle > 0;
+               config.maximum_commands_per_cycle > 0 &&
+               (config.lifecycle.on_state_changed == nullptr ||
+                (config.lifecycle.maximum_execution_us > 0 &&
+                 config.lifecycle.maximum_execution_us <= 1000000));
     }
 
     Callbacks makeDeferredCallbacks() {
         Callbacks callbacks;
-        if (user_callbacks_.on_state_changed) {
+        if (user_callbacks_.on_state_changed ||
+            runtime_config_.lifecycle.on_state_changed != nullptr) {
             callbacks.on_state_changed = [this](State old_state, State new_state) {
+                runLifecycleHook(old_state, new_state);
+                // Publish the new state only after its internal lifecycle work
+                // has completed, so readers cannot observe a half-applied state.
                 state_.store(new_state);
-                CallbackMessage* message = allocateCallback(CallbackType::StateChanged);
-                if (message != nullptr) {
-                    message->old_state = old_state;
-                    message->new_state = new_state;
+                if (user_callbacks_.on_state_changed) {
+                    CallbackMessage* message =
+                        allocateCallback(CallbackType::StateChanged);
+                    if (message != nullptr) {
+                        message->old_state = old_state;
+                        message->new_state = new_state;
+                    }
+                    enqueueCallback(message);
                 }
-                enqueueCallback(message);
             };
         }
         if (user_callbacks_.on_event) {
@@ -386,6 +411,24 @@ private:
             };
         }
         return callbacks;
+    }
+
+    void runLifecycleHook(State old_state, State new_state) {
+        const ClientRuntimeLifecycleHooks& lifecycle = runtime_config_.lifecycle;
+        if (lifecycle.on_state_changed == nullptr) {
+            return;
+        }
+        const int64_t started_us = esp_timer_get_time();
+        lifecycle.on_state_changed(lifecycle.context, old_state, new_state,
+                                   client_.sessionReady());
+        const int64_t elapsed_us = std::max<int64_t>(0, esp_timer_get_time() - started_us);
+        const uint32_t bounded_us = static_cast<uint32_t>(
+            std::min<int64_t>(elapsed_us, std::numeric_limits<uint32_t>::max()));
+        ++lifecycle_hook_calls_;
+        updateMaximum(lifecycle_hook_maximum_us_, bounded_us);
+        if (bounded_us > lifecycle.maximum_execution_us) {
+            ++lifecycle_hook_overruns_;
+        }
     }
 
     void serviceTask() {
@@ -697,6 +740,9 @@ private:
         wake_events_executed_.store(0);
         wake_events_coalesced_.store(0);
         wake_events_rejected_.store(0);
+        lifecycle_hook_calls_.store(0);
+        lifecycle_hook_overruns_.store(0);
+        lifecycle_hook_maximum_us_.store(0);
         command_queue_high_watermark_.store(0);
         callback_queue_high_watermark_.store(0);
     }

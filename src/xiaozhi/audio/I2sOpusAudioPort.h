@@ -371,6 +371,8 @@ class I2sOpusAudioPort final : public xiaozhi::EncodedAudioPort {
   void cancelPlayback() override;
   bool playbackIdle() const override;
   uint32_t queuedPlaybackMs() const override;
+  void onClientStateChanged(xiaozhi::State oldState,
+                            xiaozhi::State newState) override;
   void setRealtimeControlSink(xiaozhi::RealtimeControlSink* sink) override;
 
   // Legacy polling fallback for direct Client users without ClientRuntime.

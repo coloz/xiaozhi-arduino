@@ -496,14 +496,6 @@ void setup() {
     statusLine = xiaozhi::stateName(next);
     displayDirty = true;
     Serial.printf("[xiaozhi] state=%s\n", xiaozhi::stateName(next));
-    const bool lowLatencySession = runtime.sessionReady() ||
-                                   next == xiaozhi::State::Connecting ||
-                                   next == xiaozhi::State::Listening ||
-                                   next == xiaozhi::State::Speaking;
-    // Modem sleep is useful after the audio channel closes but can add
-    // DTIM-sized jitter even in ManualStop's idle-yet-connected state.
-    WiFi.setSleep(!lowLatencySession);
-    audioPort.setWakeDetectionEnabled(next == xiaozhi::State::Idle);
     if (next == xiaozhi::State::Listening) {
       lastSpeakingAudioMs = 0;
     } else if (next == xiaozhi::State::Speaking) {
@@ -532,7 +524,18 @@ void setup() {
     Serial.println("[audio] failed to attach the I2S/Opus audio port");
     return;
   }
-  if (runtime.begin(config, callbacks)) {
+  xiaozhi::ClientRuntimeConfig runtimeConfig;
+  runtimeConfig.lifecycle.on_state_changed =
+      [](void*, xiaozhi::State, xiaozhi::State next, bool sessionReady) {
+        const bool lowLatencySession = sessionReady ||
+                                       next == xiaozhi::State::Connecting ||
+                                       next == xiaozhi::State::Listening ||
+                                       next == xiaozhi::State::Speaking;
+        // Modem sleep can add DTIM-sized jitter even while ManualStop keeps an
+        // idle session connected, so session readiness also keeps latency low.
+        WiFi.setSleep(!lowLatencySession);
+      };
+  if (runtime.begin(config, callbacks, runtimeConfig)) {
     Serial.println("[xiaozhi] client started");
     statusLine = "idle";
     if (!provisioning.activation.present || provisioning.activation.code.empty()) {
