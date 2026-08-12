@@ -138,10 +138,18 @@ public:
                                       sizeof(Command));
         callback_queue_ = xQueueCreate(runtime_config_.callback_queue_depth,
                                        sizeof(CallbackMessage));
+        state_callback_queue_ = xQueueCreate(1, sizeof(CallbackMessage));
+        capture_callback_queue_ = xQueueCreate(1, sizeof(CallbackMessage));
+        audio_callback_queue_ = xQueueCreate(
+            runtime_config_.audio_callback_queue_depth,
+            sizeof(CallbackMessage));
         wake_event_queue_ = xQueueCreate(1, sizeof(WakeEvent));
         startup_signal_ = xSemaphoreCreateBinary();
         stopped_signal_ = xSemaphoreCreateBinary();
         if (command_queue_ == nullptr || callback_queue_ == nullptr ||
+            state_callback_queue_ == nullptr ||
+            capture_callback_queue_ == nullptr ||
+            audio_callback_queue_ == nullptr ||
             wake_event_queue_ == nullptr || startup_signal_ == nullptr ||
             stopped_signal_ == nullptr || !initializePayloadPools()) {
             releaseResources();
@@ -199,15 +207,19 @@ public:
         }
         size_t dispatched = 0;
         CallbackMessage message;
-        while ((max_callbacks == 0 || dispatched < max_callbacks) &&
-               xQueueReceive(callback_queue_, &message, 0) == pdTRUE) {
+        while (max_callbacks == 0 || dispatched < max_callbacks) {
+            if (!receiveNextCallback(message)) {
+                break;
+            }
             callback_dispatch_depth_.fetch_add(1);
             dispatchCallback(message);
             releaseCallbackPayload(message);
             callback_dispatch_depth_.fetch_sub(1);
             ++callbacks_dispatched_;
             ++dispatched;
-            if (callback_queue_ == nullptr) {
+            if (callback_queue_ == nullptr || state_callback_queue_ == nullptr ||
+                capture_callback_queue_ == nullptr ||
+                audio_callback_queue_ == nullptr) {
                 break;
             }
         }
@@ -384,12 +396,19 @@ public:
         output.audio_callbacks_dropped = audio_callbacks_dropped_.load();
         output.capture_callbacks_dropped = capture_callbacks_dropped_.load();
         output.error_callbacks_dropped = error_callbacks_dropped_.load();
+        output.audio_meta_callbacks_dropped =
+            audio_meta_callbacks_dropped_.load();
+        output.state_callbacks_coalesced = state_callbacks_coalesced_.load();
+        output.capture_callbacks_coalesced =
+            capture_callbacks_coalesced_.load();
         output.command_payload_pool_high_watermark =
             command_payload_pool_high_watermark_.load();
         output.callback_payload_pool_high_watermark =
             callback_payload_pool_high_watermark_.load();
         output.command_queue_high_watermark = command_queue_high_watermark_.load();
         output.callback_queue_high_watermark = callback_queue_high_watermark_.load();
+        output.audio_callback_queue_high_watermark =
+            audio_callback_queue_high_watermark_.load();
         return output;
     }
 
@@ -422,6 +441,7 @@ private:
         WakeWord,
         Event,
         Audio,
+        AudioMeta,
         Capture,
         Error,
     };
@@ -432,6 +452,7 @@ private:
         State new_state = State::Unknown;
         bool capture_enabled = false;
         AudioFormat capture_format;
+        AudioFrameMeta audio_meta;
         uint8_t payload_slot = 0xFF;
     };
 
@@ -481,6 +502,9 @@ private:
     Callbacks user_callbacks_;
     QueueHandle_t command_queue_ = nullptr;
     QueueHandle_t callback_queue_ = nullptr;
+    QueueHandle_t state_callback_queue_ = nullptr;
+    QueueHandle_t capture_callback_queue_ = nullptr;
+    QueueHandle_t audio_callback_queue_ = nullptr;
     QueueHandle_t wake_event_queue_ = nullptr;
     SemaphoreHandle_t startup_signal_ = nullptr;
     SemaphoreHandle_t stopped_signal_ = nullptr;
@@ -532,12 +556,16 @@ private:
     std::atomic<uint32_t> audio_callbacks_dropped_{0};
     std::atomic<uint32_t> capture_callbacks_dropped_{0};
     std::atomic<uint32_t> error_callbacks_dropped_{0};
+    std::atomic<uint32_t> audio_meta_callbacks_dropped_{0};
+    std::atomic<uint32_t> state_callbacks_coalesced_{0};
+    std::atomic<uint32_t> capture_callbacks_coalesced_{0};
     std::atomic<uint8_t> command_payloads_in_use_{0};
     std::atomic<uint8_t> callback_payloads_in_use_{0};
     std::atomic<uint8_t> command_payload_pool_high_watermark_{0};
     std::atomic<uint8_t> callback_payload_pool_high_watermark_{0};
     std::atomic<uint8_t> command_queue_high_watermark_{0};
     std::atomic<uint8_t> callback_queue_high_watermark_{0};
+    std::atomic<uint8_t> audio_callback_queue_high_watermark_{0};
 
     // Owned exclusively by the Runtime service task. uint32_t subtraction is
     // intentionally wrap-safe across the Arduino millisecond counter rollover.
@@ -578,6 +606,7 @@ private:
                config.idle_poll_interval_ms > 0 &&
                config.idle_poll_interval_ms <= 1000 &&
                config.command_queue_depth > 0 && config.callback_queue_depth > 0 &&
+               config.audio_callback_queue_depth > 0 &&
                config.maximum_commands_per_cycle > 0 &&
                config.mcp_command_pool_depth > 0 &&
                config.mcp_command_pool_depth <= 32 &&
@@ -721,18 +750,27 @@ private:
                 enqueueCallback(message);
             };
         }
-        if (user_callbacks_.on_audio || runtime_config_.playback_watchdog.enabled) {
-            callbacks.on_audio = [this](const AudioFrame& audio) {
+        if (user_callbacks_.on_audio_meta ||
+            runtime_config_.playback_watchdog.enabled) {
+            callbacks.on_audio_meta = [this](const AudioFrameMeta& meta) {
                 noteDownlinkAudio();
-                if (!user_callbacks_.on_audio) {
+                if (!user_callbacks_.on_audio_meta) {
                     return;
                 }
+                CallbackMessage message;
+                message.type = CallbackType::AudioMeta;
+                message.audio_meta = meta;
+                enqueueCallback(message);
+            };
+        }
+        if (user_callbacks_.on_audio) {
+            callbacks.on_audio = [this](const AudioFrame& audio) {
                 // Audio callbacks are observers; attached EncodedAudioPort
                 // playback is delivered directly by Client. Avoid allocating
                 // and copying Opus when a stalled user loop has filled its
                 // best-effort callback queue.
-                if (callback_queue_ == nullptr ||
-                    uxQueueSpacesAvailable(callback_queue_) == 0) {
+                if (audio_callback_queue_ == nullptr ||
+                    uxQueueSpacesAvailable(audio_callback_queue_) == 0) {
                     recordCallbackDrop(CallbackType::Audio);
                     return;
                 }
@@ -1062,6 +1100,9 @@ private:
             case CallbackType::Audio:
                 ++audio_callbacks_dropped_;
                 break;
+            case CallbackType::AudioMeta:
+                ++audio_meta_callbacks_dropped_;
+                break;
             case CallbackType::Capture:
                 ++capture_callbacks_dropped_;
                 break;
@@ -1089,6 +1130,7 @@ private:
                 error_callback_pool_.release(message.payload_slot);
                 break;
             case CallbackType::StateChanged:
+            case CallbackType::AudioMeta:
             case CallbackType::Capture:
                 return;
         }
@@ -1096,33 +1138,76 @@ private:
     }
 
     void enqueueCallback(const CallbackMessage& message) {
+        if (message.type == CallbackType::StateChanged) {
+            if (state_callback_queue_ == nullptr) {
+                recordCallbackDrop(message.type);
+                return;
+            }
+            if (uxQueueMessagesWaiting(state_callback_queue_) != 0) {
+                ++state_callbacks_coalesced_;
+            }
+            if (xQueueOverwrite(state_callback_queue_, &message) != pdTRUE) {
+                recordCallbackDrop(message.type);
+                return;
+            }
+            ++callbacks_queued_;
+            return;
+        }
+        if (message.type == CallbackType::Capture) {
+            if (capture_callback_queue_ == nullptr) {
+                recordCallbackDrop(message.type);
+                return;
+            }
+            if (uxQueueMessagesWaiting(capture_callback_queue_) != 0) {
+                ++capture_callbacks_coalesced_;
+            }
+            if (xQueueOverwrite(capture_callback_queue_, &message) != pdTRUE) {
+                recordCallbackDrop(message.type);
+                return;
+            }
+            ++callbacks_queued_;
+            return;
+        }
+        if (message.type == CallbackType::Audio ||
+            message.type == CallbackType::AudioMeta) {
+            if (audio_callback_queue_ == nullptr ||
+                xQueueSend(audio_callback_queue_, &message, 0) != pdTRUE) {
+                releaseCallbackPayload(message);
+                recordCallbackDrop(message.type);
+                return;
+            }
+            ++callbacks_queued_;
+            updateHighWatermark(audio_callback_queue_high_watermark_,
+                                uxQueueMessagesWaiting(audio_callback_queue_));
+            return;
+        }
         if (callback_queue_ == nullptr) {
             releaseCallbackPayload(message);
             recordCallbackDrop(message.type);
             return;
         }
         if (xQueueSend(callback_queue_, &message, 0) != pdTRUE) {
-            if (message.type == CallbackType::Audio) {
-                releaseCallbackPayload(message);
-                recordCallbackDrop(message.type);
-                return;
-            }
-            // State/event/error delivery has priority over a stale observer
-            // backlog. Evict one oldest callback, never wait on user code.
-            CallbackMessage oldest;
-            if (xQueueReceive(callback_queue_, &oldest, 0) == pdTRUE) {
-                releaseCallbackPayload(oldest);
-                recordCallbackDrop(oldest.type);
-            }
-            if (xQueueSend(callback_queue_, &message, 0) != pdTRUE) {
-                releaseCallbackPayload(message);
-                recordCallbackDrop(message.type);
-                return;
-            }
+            // Accepted reliable callbacks are never displaced by UI state or
+            // best-effort audio observers. A full bounded queue rejects only
+            // the new reliable item and records its exact type.
+            releaseCallbackPayload(message);
+            recordCallbackDrop(message.type);
+            return;
         }
         ++callbacks_queued_;
         updateHighWatermark(callback_queue_high_watermark_,
                             uxQueueMessagesWaiting(callback_queue_));
+    }
+
+    bool receiveNextCallback(CallbackMessage& message) {
+        return (callback_queue_ != nullptr &&
+                xQueueReceive(callback_queue_, &message, 0) == pdTRUE) ||
+               (state_callback_queue_ != nullptr &&
+                xQueueReceive(state_callback_queue_, &message, 0) == pdTRUE) ||
+               (capture_callback_queue_ != nullptr &&
+                xQueueReceive(capture_callback_queue_, &message, 0) == pdTRUE) ||
+               (audio_callback_queue_ != nullptr &&
+                xQueueReceive(audio_callback_queue_, &message, 0) == pdTRUE);
     }
 
     void enqueueWakeObserver(const char* wake_word, size_t size) {
@@ -1166,6 +1251,11 @@ private:
                 if (user_callbacks_.on_audio) {
                     user_callbacks_.on_audio(
                         audio_callback_pool_.at(message.payload_slot).audio);
+                }
+                break;
+            case CallbackType::AudioMeta:
+                if (user_callbacks_.on_audio_meta) {
+                    user_callbacks_.on_audio_meta(message.audio_meta);
                 }
                 break;
             case CallbackType::Capture:
@@ -1225,11 +1315,18 @@ private:
     }
 
     void discardCallbacks() {
-        if (callback_queue_ == nullptr) {
+        discardCallbackQueue(callback_queue_);
+        discardCallbackQueue(state_callback_queue_);
+        discardCallbackQueue(capture_callback_queue_);
+        discardCallbackQueue(audio_callback_queue_);
+    }
+
+    void discardCallbackQueue(QueueHandle_t queue) {
+        if (queue == nullptr) {
             return;
         }
         CallbackMessage message;
-        while (xQueueReceive(callback_queue_, &message, 0) == pdTRUE) {
+        while (xQueueReceive(queue, &message, 0) == pdTRUE) {
             releaseCallbackPayload(message);
         }
     }
@@ -1247,6 +1344,18 @@ private:
         if (callback_queue_ != nullptr) {
             vQueueDelete(callback_queue_);
             callback_queue_ = nullptr;
+        }
+        if (state_callback_queue_ != nullptr) {
+            vQueueDelete(state_callback_queue_);
+            state_callback_queue_ = nullptr;
+        }
+        if (capture_callback_queue_ != nullptr) {
+            vQueueDelete(capture_callback_queue_);
+            capture_callback_queue_ = nullptr;
+        }
+        if (audio_callback_queue_ != nullptr) {
+            vQueueDelete(audio_callback_queue_);
+            audio_callback_queue_ = nullptr;
         }
         if (wake_event_queue_ != nullptr) {
             vQueueDelete(wake_event_queue_);
@@ -1305,6 +1414,9 @@ private:
         audio_callbacks_dropped_.store(0);
         capture_callbacks_dropped_.store(0);
         error_callbacks_dropped_.store(0);
+        audio_meta_callbacks_dropped_.store(0);
+        state_callbacks_coalesced_.store(0);
+        capture_callbacks_coalesced_.store(0);
         command_payloads_in_use_.store(0);
         callback_payloads_in_use_.store(0);
         command_payload_pool_high_watermark_.store(0);
@@ -1316,6 +1428,7 @@ private:
         received_downlink_audio_ = false;
         command_queue_high_watermark_.store(0);
         callback_queue_high_watermark_.store(0);
+        audio_callback_queue_high_watermark_.store(0);
     }
 };
 

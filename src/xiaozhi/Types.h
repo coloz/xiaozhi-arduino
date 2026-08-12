@@ -73,12 +73,20 @@ struct AudioFrame {
     std::vector<uint8_t> opus;
 };
 
+struct AudioFrameMeta {
+    AudioFormat format;
+    uint32_t timestamp = 0;
+    size_t opus_bytes = 0;
+};
+
 struct Event {
     EventType type = EventType::UnknownMessage;
     std::string text;
     std::string status;
     // Raw protocol value retained for compatibility and custom server values.
     std::string emotion;
+    // Empty unless ClientConfig::include_raw_event_json is enabled and the
+    // message fits maximum_raw_event_json_bytes.
     std::string json;
     // Kept after the original fields so existing aggregate initialization remains valid.
     Emotion emotion_type = Emotion::Unknown;
@@ -105,6 +113,10 @@ struct ClientConfig {
     // Realtime mode so capture remains active while TTS is playing.
     bool enable_voice_barge_in = true;
     bool deliver_audio_outside_speaking = false;
+    // Raw JSON retention is opt-in. Semantic STT/TTS/emotion fields remain
+    // available through Event without copying the full protocol envelope.
+    bool include_raw_event_json = false;
+    size_t maximum_raw_event_json_bytes = 2048;
 };
 
 struct Callbacks {
@@ -116,6 +128,9 @@ struct Callbacks {
     // Kept after the original fields so existing aggregate initialization remains valid.
     // ClientRuntime dispatches this local observer after realtime wake control is accepted.
     std::function<void(const std::string& wake_word)> on_wake_word;
+    // Metadata avoids copying Opus across tasks when payload inspection is not
+    // required. Kept after existing fields for aggregate compatibility.
+    std::function<void(const AudioFrameMeta& meta)> on_audio_meta;
 };
 
 inline const char* stateName(State state) {

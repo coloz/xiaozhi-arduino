@@ -735,21 +735,21 @@ void Client::onTransportText(const uint8_t* data, size_t size) {
             Event event;
             event.type = EventType::TtsSentence;
             getString(root, "text", event.text);
-            event.json.assign(reinterpret_cast<const char*>(data), size);
+            retainEventJson(event, data, size);
             emitEvent(std::move(event));
         }
     } else if (type == "stt") {
         Event event;
         event.type = EventType::Stt;
         getString(root, "text", event.text);
-        event.json.assign(reinterpret_cast<const char*>(data), size);
+        retainEventJson(event, data, size);
         emitEvent(std::move(event));
     } else if (type == "llm") {
         Event event;
         event.type = EventType::Emotion;
         getString(root, "emotion", event.emotion);
         event.emotion_type = emotionFromName(event.emotion);
-        event.json.assign(reinterpret_cast<const char*>(data), size);
+        retainEventJson(event, data, size);
         emitEvent(std::move(event));
     } else if (type == "alert") {
         Event event;
@@ -762,7 +762,7 @@ void Client::onTransportText(const uint8_t* data, size_t size) {
             return;
         }
         event.emotion_type = emotionFromName(event.emotion);
-        event.json.assign(reinterpret_cast<const char*>(data), size);
+        retainEventJson(event, data, size);
         emitEvent(std::move(event));
     } else if (type == "mcp") {
         if (!config_.enable_mcp) {
@@ -798,13 +798,15 @@ void Client::onTransportText(const uint8_t* data, size_t size) {
         if (getString(root, "command", command) && command == "reboot") {
             Event event;
             event.type = EventType::RebootRequested;
-            event.json.assign(reinterpret_cast<const char*>(data), size);
+            retainEventJson(event, data, size);
             emitEvent(std::move(event));
         }
     } else if (type == "custom") {
         Event event;
         event.type = EventType::Custom;
-        event.json = root["payload"].isNull() ? std::string() : jsonString(root["payload"]);
+        if (config_.include_raw_event_json && !root["payload"].isNull()) {
+            retainEventJson(event, jsonString(root["payload"]));
+        }
         emitEvent(std::move(event));
     } else if (type == "goodbye") {
         std::string goodbye_session;
@@ -814,7 +816,7 @@ void Client::onTransportText(const uint8_t* data, size_t size) {
     } else {
         Event event;
         event.type = EventType::UnknownMessage;
-        event.json.assign(reinterpret_cast<const char*>(data), size);
+        retainEventJson(event, data, size);
         emitEvent(std::move(event));
     }
 }
@@ -838,6 +840,22 @@ void Client::onTransportBinary(const uint8_t* data, size_t size) {
     if (downlink_suppressed_ ||
         (!config_.deliver_audio_outside_speaking &&
          state_machine_.state() != State::Speaking)) {
+        return;
+    }
+    if (callbacks_.on_audio_meta) {
+        AudioFrameMeta meta;
+        meta.format = view.format;
+        meta.timestamp = view.timestamp;
+        meta.opus_bytes = view.opus_size;
+        beginUserCallback();
+        callbacks_.on_audio_meta(meta);
+        endUserCallback();
+        if (end_requested_ || !begun_ || !session_ready_) {
+            return;
+        }
+    }
+    if (!callbacks_.on_audio &&
+        (!audio_port_started_ || audio_port_ == nullptr)) {
         return;
     }
     AudioFrame frame;
@@ -1260,6 +1278,23 @@ void Client::emitEvent(Event event) {
         callbacks_.on_event(event);
         endUserCallback();
     }
+}
+
+void Client::retainEventJson(Event& event, const uint8_t* data,
+                             size_t size) const {
+    if (!config_.include_raw_event_json || data == nullptr ||
+        size > config_.maximum_raw_event_json_bytes) {
+        return;
+    }
+    event.json.assign(reinterpret_cast<const char*>(data), size);
+}
+
+void Client::retainEventJson(Event& event, std::string json) const {
+    if (!config_.include_raw_event_json ||
+        json.size() > config_.maximum_raw_event_json_bytes) {
+        return;
+    }
+    event.json = std::move(json);
 }
 
 void Client::reportError(ErrorCode code, const std::string& message) {

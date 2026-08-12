@@ -3,12 +3,12 @@
  *
  * 演示 ESP32 在不接显示屏和音频驱动的情况下，通过安全 WebSocket 连接
  * Xiaozhi 服务，并在串口输出状态、事件和下行音频信息。运行前请填写 Wi-Fi、
- * WebSocket 地址、令牌及根证书；如需播放语音，还要在 on_audio 中接入解码器。
+ * WebSocket 地址、令牌及根证书；如需播放语音，应挂接 EncodedAudioPort。
  *
  * Demonstrates an ESP32 connecting to a Xiaozhi service over secure WebSocket
  * without a display or audio driver, while logging states, events, and downlink
  * audio information to Serial. Before use, set the Wi-Fi, WebSocket URL, token,
- * and root CA; add a decoder in on_audio if speech playback is required.
+ * and root CA; attach an EncodedAudioPort if speech playback is required.
  */
 
 #include <WiFi.h>
@@ -56,10 +56,12 @@ void setup() {
     Serial.printf("event=%u text=%s emotion=%s\n", static_cast<unsigned>(event.type),
                   event.text.c_str(), event.emotion.c_str());
   };
-  callbacks.on_audio = [](const xiaozhi::AudioFrame& frame) {
-    // Feed frame.opus to an external Opus decoder/audio driver here.
-    Serial.printf("audio: %u bytes @ %lu Hz\n", static_cast<unsigned>(frame.opus.size()),
-                  static_cast<unsigned long>(frame.format.sample_rate));
+  callbacks.on_audio_meta = [](const xiaozhi::AudioFrameMeta& meta) {
+    // Metadata avoids copying the Opus payload into the application task.
+    Serial.printf("audio: %u bytes @ %lu Hz, %u ms\n",
+                  static_cast<unsigned>(meta.opus_bytes),
+                  static_cast<unsigned long>(meta.format.sample_rate),
+                  meta.format.frame_duration_ms);
   };
   callbacks.on_error = [](xiaozhi::ErrorCode code, const std::string& message) {
     Serial.printf("error[%s]: %s\n", xiaozhi::errorName(code), message.c_str());

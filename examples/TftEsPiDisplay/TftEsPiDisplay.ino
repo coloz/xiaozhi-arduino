@@ -134,6 +134,7 @@ std::string roleLine = "system";
 std::string messageLine = "Xiaozhi Arduino";
 bool displayDirty = true;
 uint32_t lastDrawMs = 0;
+uint32_t downlinkAudioFrames = 0;
 bool chatButtonReading = HIGH;
 bool chatButtonStableState = HIGH;
 uint32_t chatButtonChangedMs = 0;
@@ -503,6 +504,15 @@ void setup() {
     Serial.printf("[xiaozhi] capture=%s format=%lu Hz/%u ch/%u ms\n",
                   enabled ? "on" : "off", static_cast<unsigned long>(format.sample_rate),
                   format.channels, format.frame_duration_ms);
+  };
+  callbacks.on_audio_meta = [](const xiaozhi::AudioFrameMeta& meta) {
+    ++downlinkAudioFrames;
+    if ((downlinkAudioFrames & 0x3fU) == 1U) {
+      Serial.printf("[xiaozhi] audio=%lu frames, last=%u bytes/%u ms\n",
+                    static_cast<unsigned long>(downlinkAudioFrames),
+                    static_cast<unsigned>(meta.opus_bytes),
+                    meta.format.frame_duration_ms);
+    }
   };
   callbacks.on_error = [](xiaozhi::ErrorCode code, const std::string& message) {
     statusLine = "error";

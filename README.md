@@ -178,9 +178,11 @@ void loop() {
 
 推荐 Arduino 应用使用 `ClientRuntime`。它把单写者 `Client`、WebSocket 轮询、协议超时和 `EncodedAudioPort::loop()` 固定在独立 FreeRTOS 任务；普通请求通过有界队列非阻塞提交，stop、abort、wake 和本地 mute 则进入优先于普通命令/MCP 的固定紧急通道。同类紧急意图会合并，wake 保留最新的固定长度内容，因此显示刷新、传感器读取或第三方库偶尔卡住 Arduino `loopTask` 时，小智链路和本地打断仍继续运行。
 
-`runtime.loop()` 只限量派发用户回调，默认每次最多 4 个；即使暂时不调用，也只会延迟 UI/日志，不会停止协议和已挂接音频端口。Runtime 初始化时为 MCP、wake、event、audio observer 和 error 分别建立固定 payload 池，小型控制/状态直接按值排队；提交前先按各自上限检查长度，池耗尽或队列拥塞时按消息类型计数，不在热路径逐条 `new/delete`。池深与长度上限可在 `ClientRuntimeConfig` 调整，未订阅的 observer 不建立对应池；`runtime.stats()` 可查看池耗尽、按类型丢弃、紧急控制合并和队列/池最高水位。不要在 Runtime 活动期间直接调用底层 `client`；改用 `request*` 方法。按键中断可使用 `requestStopListeningFromISR()`、`requestAbortSpeakingFromISR()`、`requestWakeWordDetectedFromISR()` 和 `requestPlaybackMuteFromISR()`；这些接口只发布 pending bit 或固定结构，不在 ISR 中调用协议或音频代码。需要完全自定义调度或同步主机测试时，仍可不创建 Runtime，继续直接使用 `Client::loop()`。
+`runtime.loop()` 只限量派发用户回调，默认每次最多 4 个；即使暂时不调用，也只会延迟 UI/日志，不会停止协议和已挂接音频端口。Runtime 为回调按语义分流：state/capture 各使用一个只保留最新值的覆盖槽，wake/event/error 使用独立的有界可靠队列，audio observer 使用可丢弃的 best-effort 队列，绝不会挤占关键事件或影响音频端口的实际播放。Runtime 初始化时还为 MCP、wake、event、完整 audio observer 和 error 分别建立固定 payload 池；提交前先按各自上限检查长度，池耗尽或队列拥塞时按消息类型计数，不在热路径逐条 `new/delete`。池深与长度上限可在 `ClientRuntimeConfig` 调整，未订阅的 observer 不建立对应池；`runtime.stats()` 可查看合并次数、按类型丢弃和队列/池最高水位。不要在 Runtime 活动期间直接调用底层 `client`；改用 `request*` 方法。按键中断可使用 `requestStopListeningFromISR()`、`requestAbortSpeakingFromISR()`、`requestWakeWordDetectedFromISR()` 和 `requestPlaybackMuteFromISR()`；这些接口只发布 pending bit 或固定结构，不在 ISR 中调用协议或音频代码。需要完全自定义调度或同步主机测试时，仍可不创建 Runtime，继续直接使用 `Client::loop()`。
 
-默认 Runtime 使用 8192 字节栈、优先级 2、固定到 core 0；活动会话每 2 ms 服务一次，空闲时降到 20 ms，命令仍会立即唤醒任务。可通过 `ClientRuntimeConfig` 调整。双核 Arduino 通常把 `loopTask` 放在 core 1，因此默认值能隔离大多数用户代码；单核芯片的有效 core 仍是 0。回调消息按需分配，设置 `on_audio` 会为了跨任务派发复制 Opus payload；已经挂接 `EncodedAudioPort` 且不需要观察原始下行包时，省略 `on_audio` 可减少热路径分配。
+默认 Runtime 使用 8192 字节栈、优先级 2、固定到 core 0；活动会话每 2 ms 服务一次，空闲时降到 20 ms，命令仍会立即唤醒任务。可通过 `ClientRuntimeConfig` 调整。双核 Arduino 通常把 `loopTask` 放在 core 1，因此默认值能隔离大多数用户代码；单核芯片的有效 core 仍是 0。只需要统计或显示下行音频时，优先设置 `on_audio_meta`，它只跨任务传递时间戳、Opus 字节数和音频格式；只有确实需要读取 Opus 内容时才设置 `on_audio`，后者会从固定池复制 payload。已经挂接 `EncodedAudioPort` 时，observer 拥塞只丢观察回调，不会丢实际播放数据。
+
+`Event` 默认只保留已解析的 STT、TTS、emotion、alert 等语义字段，不复制原始协议 JSON。调试或自定义协议确实需要原文时，可显式设置 `ClientConfig::include_raw_event_json = true`，并用 `maximum_raw_event_json_bytes` 设置不大于 `max_json_bytes` 的严格上限；超限事件仍提供语义字段，但 `event.json` 为空。
 
 Runtime 默认还会监控 TTS 播放：进入 `Speaking` 后 12 秒未收到首包，或最后一包后 12 秒仍未继续且播放端已空闲，会在服务任务中直接关闭过期会话；该判断不依赖 Arduino `loop()` 或 UI 回调。可用 `ClientRuntimeConfig::playback_watchdog` 调整两个超时或禁用，并通过 `runtime.stats()` 查看首包/包间超时次数和播放忙闲。
 

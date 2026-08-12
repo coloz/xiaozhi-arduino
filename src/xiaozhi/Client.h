@@ -157,6 +157,8 @@ private:
     void finishDeferredEnd();
     void clearSession();
     void handleStateChange(State old_state, State new_state);
+    void retainEventJson(Event& event, const uint8_t* data, size_t size) const;
+    void retainEventJson(Event& event, std::string json) const;
     void emitEvent(Event event);
     void reportError(ErrorCode code, const std::string& message);
 };

@@ -49,6 +49,8 @@ struct ClientRuntimeConfig {
     uint16_t poll_interval_ms = 2;
     uint16_t idle_poll_interval_ms = 20;
     uint8_t command_queue_depth = 8;
+    // Reliable event/error/wake queue. State and capture use independent
+    // single-slot overwrite channels; audio observers use their own queue.
     uint8_t callback_queue_depth = 12;
     uint8_t maximum_commands_per_cycle = 4;
     // Large payloads use separate fixed pools so small control/state messages
@@ -67,6 +69,8 @@ struct ClientRuntimeConfig {
     size_t maximum_error_message_bytes = 512;
     ClientRuntimeLifecycleHooks lifecycle;
     ClientRuntimePlaybackWatchdogConfig playback_watchdog;
+    // Kept after the original fields so aggregate initialization remains valid.
+    uint8_t audio_callback_queue_depth = 2;
 };
 
 struct ClientRuntimeStats {
@@ -104,6 +108,11 @@ struct ClientRuntimeStats {
     uint8_t callback_payload_pool_high_watermark = 0;
     uint8_t command_queue_high_watermark = 0;
     uint8_t callback_queue_high_watermark = 0;
+    // Kept after the original fields so aggregate initialization remains valid.
+    uint32_t audio_meta_callbacks_dropped = 0;
+    uint32_t state_callbacks_coalesced = 0;
+    uint32_t capture_callbacks_coalesced = 0;
+    uint8_t audio_callback_queue_high_watermark = 0;
 };
 
 class ClientRuntime {

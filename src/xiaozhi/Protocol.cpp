@@ -154,6 +154,12 @@ bool Protocol::validateConfig(const ClientConfig& config, std::string& error) {
         error = "JSON limit must be 1024..16384 and audio payload limit 1..8192 bytes";
         return false;
     }
+    if (config.include_raw_event_json &&
+        (config.maximum_raw_event_json_bytes == 0 ||
+         config.maximum_raw_event_json_bytes > config.max_json_bytes)) {
+        error = "raw event JSON limit must fit within max_json_bytes";
+        return false;
+    }
     error.clear();
     return true;
 }

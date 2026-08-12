@@ -139,6 +139,8 @@ uint32_t nextDemoEmotionMs = 0;
 uint32_t activationRefreshAtMs = 0;
 uint32_t lastActivationCountdownSec = 0xFFFFFFFFUL;
 uint32_t lastHeartbeatMs = 0;
+uint32_t downlinkAudioFrames = 0;
+uint32_t downlinkAudioBytes = 0;
 bool chatButtonReading = HIGH;
 bool chatButtonStableState = HIGH;
 uint32_t chatButtonChangedMs = 0;
@@ -467,6 +469,10 @@ void setup() {
                   static_cast<unsigned long>(format.sample_rate),
                   format.channels, format.frame_duration_ms);
   };
+  callbacks.on_audio_meta = [](const xiaozhi::AudioFrameMeta& meta) {
+    ++downlinkAudioFrames;
+    downlinkAudioBytes += static_cast<uint32_t>(meta.opus_bytes);
+  };
   callbacks.on_error = [](xiaozhi::ErrorCode code, const std::string& message) {
     // The official service may close an otherwise completed session after
     // returning to idle. Keep that normal close from replacing the last
@@ -543,12 +549,14 @@ void loop() {
     lastHeartbeatMs = now;
     Serial.printf(
         "[heartbeat] eyes=%s wifi=%d client=%s emotion=%u,%s "
-        "display=%u,%s heap=%lu\n",
+        "display=%u,%s audio=%lu/%lu heap=%lu\n",
         eyesReady ? "ready" : "failed", static_cast<int>(WiFi.status()),
         runtime.stateName(), static_cast<unsigned>(currentEmotion),
         xiaozhi::emotionName(currentEmotion),
         static_cast<unsigned>(eyes.xiaozhiExpression()),
         currentEmotionName.c_str(),
+        static_cast<unsigned long>(downlinkAudioFrames),
+        static_cast<unsigned long>(downlinkAudioBytes),
         static_cast<unsigned long>(ESP.getFreeHeap()));
   }
 
