@@ -330,6 +330,7 @@ struct I2sOpusAudioPort::Impl {
   std::atomic<bool> decoderResetRequested{false};
   std::atomic<uint32_t> lastPlaybackWriteMs{0};
   std::atomic<bool> playbackSuppressed{false};
+  std::atomic<bool> manualPlaybackMuted{false};
   std::atomic<uint32_t> capturedPackets{0};
   std::atomic<uint32_t> latestCapturePeak{0};
   std::atomic<uint32_t> latestCaptureRms{0};
@@ -1799,8 +1800,11 @@ struct I2sOpusAudioPort::Impl {
                   !decodeInFlight && !outputInFlight;
         xSemaphoreGive(queueMutex);
       }
-      if (drained && !playbackMuted.load() &&
-          millis() - lastPlaybackWriteMs.load() > config.playbackMuteDelayMs) {
+      if (manualPlaybackMuted.load() && !playbackMuted.load()) {
+        applyCodecMute(true);
+      } else if (drained && !playbackMuted.load() &&
+                 millis() - lastPlaybackWriteMs.load() >
+                     config.playbackMuteDelayMs) {
         applyCodecMute(true);
       }
       ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(20));
@@ -2427,7 +2431,12 @@ struct I2sOpusAudioPort::Impl {
     if (chunk.generation != playbackGeneration.load() || playbackSuppressed.load()) {
       return false;
     }
-    if (playbackMuted.load()) {
+    if (manualPlaybackMuted.load() && !playbackMuted.load()) {
+      if (!applyCodecMute(true)) {
+        ++outputErrors;
+        return false;
+      }
+    } else if (playbackMuted.load() && !manualPlaybackMuted.load()) {
       if (!applyCodecMute(false)) {
         ++outputErrors;
         return false;
@@ -2560,6 +2569,20 @@ struct I2sOpusAudioPort::Impl {
     if (outputTask != nullptr) {
       xTaskNotifyGive(outputTask);
     }
+  }
+
+  bool setManualPlaybackMuted(bool muted) {
+    manualPlaybackMuted.store(muted);
+    // Applying both directions here gives a button/ISR request a deterministic
+    // effect. The output task will re-mute an idle speaker after its normal
+    // delay and will not auto-unmute while manual mute remains asserted.
+    applyCodecMute(muted);
+    if (outputTask != nullptr) {
+      xTaskNotifyGive(outputTask);
+    }
+    // The final intent is retained even if the codec mutex was temporarily
+    // busy; the output task enforces it before writing its next chunk.
+    return true;
   }
 
   void clearCaptureQueues() {
@@ -2800,6 +2823,7 @@ bool I2sOpusAudioPort::begin(const xiaozhi::AudioFormat& captureFormat, Uplink u
     impl_->wakeMono.clear();
   }
   impl_->captureFormat = captureFormat;
+  impl_->manualPlaybackMuted.store(false);
   impl_->initializeCaptureFilter();
   impl_->uplink = std::move(uplink);
   if (!impl_->beginI2s() || !impl_->beginCodec() || !impl_->beginEncoder()) {
@@ -2899,6 +2923,11 @@ void I2sOpusAudioPort::cancelPlayback() {
 bool I2sOpusAudioPort::playbackIdle() const {
   return impl_ == nullptr || !impl_->started ||
          impl_->isPlaybackIdle();
+}
+
+bool I2sOpusAudioPort::setPlaybackMuted(bool muted) {
+  return impl_ != nullptr && impl_->started &&
+         impl_->setManualPlaybackMuted(muted);
 }
 
 uint32_t I2sOpusAudioPort::queuedPlaybackMs() const {

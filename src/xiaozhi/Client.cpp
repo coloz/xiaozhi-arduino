@@ -542,6 +542,15 @@ bool Client::playbackIdle() const {
            audio_port_->playbackIdle();
 }
 
+bool Client::setPlaybackMuted(bool muted) {
+    DispatchScope dispatch(*this);
+    if (user_callback_depth_ != 0 || end_requested_ || !begun_ || ending_ ||
+        !audio_port_started_ || audio_port_ == nullptr) {
+        return false;
+    }
+    return audio_port_->setPlaybackMuted(muted);
+}
+
 bool Client::attachRealtimeControlSink(RealtimeControlSink* sink) {
     DispatchScope dispatch(*this);
     if (user_callback_depth_ != 0 || end_requested_ || begun_) {

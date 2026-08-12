@@ -325,7 +325,10 @@ void toggleDialogue(const char* source) {
     return;
   }
   Serial.printf("[xiaozhi] dialogue toggle from %s\n", source);
-  if (!runtime.requestToggleChat()) {
+  const bool accepted = runtime.state() == xiaozhi::State::Speaking
+                            ? runtime.requestAbortSpeaking()
+                            : runtime.requestToggleChat();
+  if (!accepted) {
     Serial.printf("[xiaozhi] dialogue toggle from %s failed in state=%s\n",
                   source, runtime.stateName());
   }

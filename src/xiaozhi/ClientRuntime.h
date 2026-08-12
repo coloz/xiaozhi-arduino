@@ -74,6 +74,10 @@ struct ClientRuntimeStats {
     uint32_t playback_inter_packet_timeouts = 0;
     uint32_t playback_timeout_close_failures = 0;
     bool playback_idle = true;
+    uint32_t urgent_controls_queued = 0;
+    uint32_t urgent_controls_executed = 0;
+    uint32_t urgent_controls_coalesced = 0;
+    uint32_t urgent_controls_rejected = 0;
     uint8_t command_queue_high_watermark = 0;
     uint8_t callback_queue_high_watermark = 0;
 };
@@ -102,15 +106,25 @@ public:
     size_t loop(size_t max_callbacks = 4);
 
     // Request methods are non-blocking and safe to call from the Arduino task
-    // or other application tasks. true means accepted into the bounded command
-    // queue; execution errors are reported through on_error.
+    // or other application tasks. Stop/abort/wake/mute use a fixed high-priority
+    // channel and coalesce repeated intent; other requests use the normal queue.
     bool requestStartListening(ListeningMode mode = ListeningMode::ManualStop);
     bool requestStopListening();
     bool requestToggleChat();
     bool requestAbortSpeaking(AbortReason reason = AbortReason::None);
     bool requestWakeWordDetected(const std::string& wake_word);
+    bool requestWakeWordDetected(const char* wake_word, size_t size);
+    bool requestPlaybackMute(bool muted);
     bool requestCloseSession();
     bool requestSendMcp(const std::string& json_rpc_payload);
+
+    // ISR variants only publish a bit or a fixed-size wake event. They never
+    // allocate, wait, or invoke Client/audio code in interrupt context.
+    bool requestStopListeningFromISR();
+    bool requestAbortSpeakingFromISR(
+        AbortReason reason = AbortReason::None);
+    bool requestWakeWordDetectedFromISR(const char* wake_word, size_t size);
+    bool requestPlaybackMuteFromISR(bool muted);
 
     bool running() const;
     bool ready() const;

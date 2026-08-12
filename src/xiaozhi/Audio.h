@@ -73,6 +73,12 @@ public:
     // false when worker state cannot be sampled immediately. Auto/realtime
     // listening waits for this signal before reopening capture.
     virtual bool playbackIdle() const { return true; }
+    // Apply an explicit local speaker mute on the Client owner task. The mute
+    // request should take effect promptly and remain independent of UI work.
+    virtual bool setPlaybackMuted(bool muted) {
+        (void)muted;
+        return false;
+    }
     // Best-effort observability for UI/diagnostics; zero is valid for ports that
     // do not expose their queue depth.
     virtual uint32_t queuedPlaybackMs() const { return 0; }

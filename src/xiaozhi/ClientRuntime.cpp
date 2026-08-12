@@ -154,7 +154,7 @@ public:
     }
 
     bool requestStopListening() {
-        return enqueueCommand(allocateCommand(CommandType::StopListening));
+        return publishUrgentControl(kUrgentStopListening);
     }
 
     bool requestToggleChat() {
@@ -162,19 +162,39 @@ public:
     }
 
     bool requestAbortSpeaking(AbortReason reason) {
-        Command* command = allocateCommand(CommandType::AbortSpeaking);
-        if (command != nullptr) {
-            command->abort_reason = reason;
-        }
-        return enqueueCommand(command);
+        pending_abort_reason_.store(static_cast<uint8_t>(reason));
+        return publishUrgentControl(kUrgentAbortSpeaking);
     }
 
     bool requestWakeWordDetected(const std::string& wake_word) {
-        Command* command = allocateCommand(CommandType::WakeWordDetected);
-        if (command != nullptr) {
-            command->payload = wake_word;
-        }
-        return enqueueCommand(command);
+        return notifyWakeWordDetected(wake_word.data(), wake_word.size(), false);
+    }
+
+    bool requestWakeWordDetected(const char* wake_word, size_t size) {
+        return notifyWakeWordDetected(wake_word, size, false);
+    }
+
+    bool requestPlaybackMute(bool muted) {
+        pending_playback_mute_.store(muted);
+        return publishUrgentControl(kUrgentPlaybackMute);
+    }
+
+    bool requestStopListeningFromISR() {
+        return publishUrgentControl(kUrgentStopListening);
+    }
+
+    bool requestAbortSpeakingFromISR(AbortReason reason) {
+        pending_abort_reason_.store(static_cast<uint8_t>(reason));
+        return publishUrgentControl(kUrgentAbortSpeaking);
+    }
+
+    bool requestWakeWordDetectedFromISR(const char* wake_word, size_t size) {
+        return notifyWakeWordDetected(wake_word, size, true);
+    }
+
+    bool requestPlaybackMuteFromISR(bool muted) {
+        pending_playback_mute_.store(muted);
+        return publishUrgentControl(kUrgentPlaybackMute);
     }
 
     bool requestCloseSession() {
@@ -196,6 +216,7 @@ public:
             wake_event_queue_ == nullptr || !running_.load() ||
             stop_requested_.load()) {
             ++wake_events_rejected_;
+            ++urgent_controls_rejected_;
             return false;
         }
         WakeEvent event;
@@ -203,23 +224,39 @@ public:
         std::copy_n(wake_word, size, event.text);
         event.text[size] = '\0';
         BaseType_t queued = pdFALSE;
+        bool coalesced = false;
         if (from_isr) {
             BaseType_t higher_priority_task_woken = pdFALSE;
             queued = xQueueSendFromISR(wake_event_queue_, &event,
                                        &higher_priority_task_woken);
+            if (queued != pdTRUE) {
+                queued = xQueueOverwriteFromISR(wake_event_queue_, &event,
+                                                &higher_priority_task_woken);
+                coalesced = queued == pdTRUE;
+            }
             if (higher_priority_task_woken == pdTRUE) {
                 portYIELD_FROM_ISR();
             }
         } else {
             queued = xQueueSend(wake_event_queue_, &event, 0);
+            if (queued != pdTRUE) {
+                queued = xQueueOverwrite(wake_event_queue_, &event);
+                coalesced = queued == pdTRUE;
+            }
         }
         if (queued != pdTRUE) {
-            // One pending wake is sufficient: WakeNet disables its generation
-            // after detection, and duplicate producers must not queue storms.
-            ++wake_events_coalesced_;
-            return true;
+            ++wake_events_rejected_;
+            ++urgent_controls_rejected_;
+            return false;
         }
-        ++wake_events_queued_;
+        if (coalesced) {
+            // Retain the newest fixed payload while one wake intent is pending.
+            ++wake_events_coalesced_;
+            ++urgent_controls_coalesced_;
+        } else {
+            ++wake_events_queued_;
+            ++urgent_controls_queued_;
+        }
         return true;
     }
 
@@ -251,6 +288,10 @@ public:
         output.playback_timeout_close_failures =
             playback_timeout_close_failures_.load();
         output.playback_idle = playback_idle_.load();
+        output.urgent_controls_queued = urgent_controls_queued_.load();
+        output.urgent_controls_executed = urgent_controls_executed_.load();
+        output.urgent_controls_coalesced = urgent_controls_coalesced_.load();
+        output.urgent_controls_rejected = urgent_controls_rejected_.load();
         output.command_queue_high_watermark = command_queue_high_watermark_.load();
         output.callback_queue_high_watermark = callback_queue_high_watermark_.load();
         return output;
@@ -259,10 +300,7 @@ public:
 private:
     enum class CommandType : uint8_t {
         StartListening,
-        StopListening,
         ToggleChat,
-        AbortSpeaking,
-        WakeWordDetected,
         CloseSession,
         SendMcp,
     };
@@ -271,7 +309,6 @@ private:
         explicit Command(CommandType value) : type(value) {}
         CommandType type;
         ListeningMode listening_mode = ListeningMode::ManualStop;
-        AbortReason abort_reason = AbortReason::None;
         std::string payload;
     };
 
@@ -337,6 +374,14 @@ private:
     std::atomic<uint32_t> playback_inter_packet_timeouts_{0};
     std::atomic<uint32_t> playback_timeout_close_failures_{0};
     std::atomic<bool> playback_idle_{true};
+    std::atomic<uint32_t> pending_urgent_controls_{0};
+    std::atomic<uint8_t> pending_abort_reason_{
+        static_cast<uint8_t>(AbortReason::None)};
+    std::atomic<bool> pending_playback_mute_{false};
+    std::atomic<uint32_t> urgent_controls_queued_{0};
+    std::atomic<uint32_t> urgent_controls_executed_{0};
+    std::atomic<uint32_t> urgent_controls_coalesced_{0};
+    std::atomic<uint32_t> urgent_controls_rejected_{0};
     std::atomic<uint8_t> command_queue_high_watermark_{0};
     std::atomic<uint8_t> callback_queue_high_watermark_{0};
 
@@ -347,6 +392,25 @@ private:
     uint32_t last_downlink_audio_ms_ = 0;
     bool playback_watchdog_armed_ = false;
     bool received_downlink_audio_ = false;
+
+    static constexpr uint32_t kUrgentAbortSpeaking = 1U << 0;
+    static constexpr uint32_t kUrgentStopListening = 1U << 1;
+    static constexpr uint32_t kUrgentPlaybackMute = 1U << 2;
+
+    bool publishUrgentControl(uint32_t control) {
+        if (!running_.load() || stop_requested_.load()) {
+            ++urgent_controls_rejected_;
+            return false;
+        }
+        const uint32_t previous =
+            pending_urgent_controls_.fetch_or(control, std::memory_order_release);
+        if ((previous & control) != 0) {
+            ++urgent_controls_coalesced_;
+        } else {
+            ++urgent_controls_queued_;
+        }
+        return true;
+    }
 
     static void serviceTaskEntry(void* argument) {
         static_cast<Impl*>(argument)->serviceTask();
@@ -551,8 +615,8 @@ private:
 
         if (begun) {
             while (!stop_requested_.load()) {
+                processUrgentControls();
                 servicePlaybackWatchdog();
-                processWakeEvents();
                 processCommands();
                 if (stop_requested_.load()) {
                     break;
@@ -569,6 +633,9 @@ private:
                     std::max<TickType_t>(1, pdMS_TO_TICKS(interval_ms));
                 Command* command = nullptr;
                 if (xQueueReceive(command_queue_, &command, poll_ticks) == pdTRUE) {
+                    // A control bit may have arrived while this task was
+                    // waiting on the normal queue. Preserve urgent priority.
+                    processUrgentControls();
                     executeCommand(command);
                     snapshotClient();
                 }
@@ -605,6 +672,40 @@ private:
         }
     }
 
+    void processUrgentControls() {
+        const uint32_t controls =
+            pending_urgent_controls_.exchange(0, std::memory_order_acquire);
+        if ((controls & kUrgentAbortSpeaking) != 0) {
+            const AbortReason reason = static_cast<AbortReason>(
+                pending_abort_reason_.load(std::memory_order_relaxed));
+            const bool accepted = client_.abortSpeaking(reason);
+            ++urgent_controls_executed_;
+            if (!accepted) {
+                ++urgent_controls_rejected_;
+            }
+            snapshotClient();
+        }
+        if ((controls & kUrgentStopListening) != 0) {
+            const bool accepted = client_.stopListening();
+            ++urgent_controls_executed_;
+            if (!accepted) {
+                ++urgent_controls_rejected_;
+            }
+            snapshotClient();
+        }
+        if ((controls & kUrgentPlaybackMute) != 0) {
+            const bool accepted =
+                client_.setPlaybackMuted(pending_playback_mute_.load());
+            ++urgent_controls_executed_;
+            if (!accepted) {
+                ++urgent_controls_rejected_;
+            }
+        }
+        // Wake is intentionally last: if abort/stop and wake arrive together,
+        // the final user intent is to begin the newest wake turn.
+        processWakeEvents();
+    }
+
     void processWakeEvents() {
         if (wake_event_queue_ == nullptr) {
             return;
@@ -613,6 +714,7 @@ private:
         if (xQueueReceive(wake_event_queue_, &event, 0) != pdTRUE) {
             return;
         }
+        ++urgent_controls_executed_;
         const State current = client_.state();
         if (!client_.ready() ||
             (current != State::Idle && current != State::Listening &&
@@ -620,11 +722,13 @@ private:
             // Connecting and other transient states already represent a wake
             // in progress; consume duplicates without generating Client errors.
             ++wake_events_rejected_;
+            ++urgent_controls_rejected_;
             return;
         }
         std::string wake_word(event.text, event.size);
         if (!client_.wakeWordDetected(wake_word)) {
             ++wake_events_rejected_;
+            ++urgent_controls_rejected_;
             return;
         }
         ++wake_events_executed_;
@@ -759,20 +863,8 @@ private:
             case CommandType::StartListening:
                 accepted = client_.startListening(command->listening_mode);
                 break;
-            case CommandType::StopListening:
-                accepted = client_.stopListening();
-                break;
             case CommandType::ToggleChat:
                 accepted = client_.toggleChat();
-                break;
-            case CommandType::AbortSpeaking:
-                accepted = client_.abortSpeaking(command->abort_reason);
-                break;
-            case CommandType::WakeWordDetected:
-                accepted = client_.wakeWordDetected(command->payload);
-                if (accepted) {
-                    enqueueWakeObserver(command->payload);
-                }
                 break;
             case CommandType::CloseSession:
                 accepted = client_.closeSession();
@@ -836,6 +928,7 @@ private:
         }
         ready_.store(false);
         session_ready_.store(false);
+        pending_urgent_controls_.store(0);
     }
 
     void resetStats() {
@@ -857,6 +950,13 @@ private:
         playback_inter_packet_timeouts_.store(0);
         playback_timeout_close_failures_.store(0);
         playback_idle_.store(true);
+        pending_urgent_controls_.store(0);
+        pending_abort_reason_.store(static_cast<uint8_t>(AbortReason::None));
+        pending_playback_mute_.store(false);
+        urgent_controls_queued_.store(0);
+        urgent_controls_executed_.store(0);
+        urgent_controls_coalesced_.store(0);
+        urgent_controls_rejected_.store(0);
         speaking_started_ms_ = 0;
         first_downlink_audio_ms_ = 0;
         last_downlink_audio_ms_ = 0;
@@ -896,6 +996,31 @@ bool ClientRuntime::requestAbortSpeaking(AbortReason reason) {
 
 bool ClientRuntime::requestWakeWordDetected(const std::string& wake_word) {
     return impl_->requestWakeWordDetected(wake_word);
+}
+
+bool ClientRuntime::requestWakeWordDetected(const char* wake_word, size_t size) {
+    return impl_->requestWakeWordDetected(wake_word, size);
+}
+
+bool ClientRuntime::requestPlaybackMute(bool muted) {
+    return impl_->requestPlaybackMute(muted);
+}
+
+bool ClientRuntime::requestStopListeningFromISR() {
+    return impl_->requestStopListeningFromISR();
+}
+
+bool ClientRuntime::requestAbortSpeakingFromISR(AbortReason reason) {
+    return impl_->requestAbortSpeakingFromISR(reason);
+}
+
+bool ClientRuntime::requestWakeWordDetectedFromISR(const char* wake_word,
+                                                   size_t size) {
+    return impl_->requestWakeWordDetectedFromISR(wake_word, size);
+}
+
+bool ClientRuntime::requestPlaybackMuteFromISR(bool muted) {
+    return impl_->requestPlaybackMuteFromISR(muted);
 }
 
 bool ClientRuntime::requestCloseSession() { return impl_->requestCloseSession(); }

@@ -370,6 +370,7 @@ class I2sOpusAudioPort final : public xiaozhi::EncodedAudioPort {
   void play(xiaozhi::AudioFrame&& frame) override;
   void cancelPlayback() override;
   bool playbackIdle() const override;
+  bool setPlaybackMuted(bool muted) override;
   uint32_t queuedPlaybackMs() const override;
   void onClientStateChanged(xiaozhi::State oldState,
                             xiaozhi::State newState) override;

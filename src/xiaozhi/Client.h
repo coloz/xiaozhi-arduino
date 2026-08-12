@@ -48,6 +48,7 @@ public:
     // Runtime owner-task observability for playback watchdogs. These methods
     // must follow the same single-task rule as the other Client APIs.
     bool playbackIdle() const;
+    bool setPlaybackMuted(bool muted);
 
     McpServer& mcp() { return mcp_server_; }
     const McpServer& mcp() const { return mcp_server_; }
