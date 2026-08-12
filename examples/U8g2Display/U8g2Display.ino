@@ -28,7 +28,8 @@
 U8G2_SSD1306_128X64_NONAME_F_SW_I2C oled(
     U8G2_R0, XIAOZHI_U8G2_CLOCK_PIN, XIAOZHI_U8G2_DATA_PIN,
     U8X8_PIN_NONE);
-xiaozhi::ArduinoWebSocketTransport transport;
+xiaozhi::ArduinoWebSocketTransport network_transport;
+xiaozhi::AsyncTransport transport(network_transport);
 
 namespace {
 constexpr char kWifiSsid[] = "YOUR_WIFI_SSID";
@@ -99,7 +100,7 @@ void setup() {
     return;
   }
 
-  transport.setCACertificate(kRootCa);
+  network_transport.setCACertificate(kRootCa);
   xiaozhi::ClientConfig config;
   config.websocket_url = kWebSocketUrl;
   config.authorization = kToken;

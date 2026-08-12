@@ -59,6 +59,9 @@ public:
     // Runtime-only control attachment. Configure it before begin() and clear it
     // after end(); application code normally never needs to call this directly.
     bool attachRealtimeControlSink(RealtimeControlSink* sink);
+    // Runtime uses this to wake its owner task when asynchronous RX arrives.
+    // Configure it only before begin() and clear it after end().
+    bool setTransportEventNotifier(TransportEventNotifier notifier);
 
 private:
     enum class DeferredTextRequirement : uint8_t {
@@ -138,6 +141,7 @@ private:
     void onTransportBinary(const uint8_t* data, size_t size);
     void onTransportClose();
     void onTransportError(const std::string& message);
+    void onTransportReconnecting();
 
     bool connectSession();
     bool enterListening();

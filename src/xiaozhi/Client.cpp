@@ -238,6 +238,11 @@ bool Client::startListening(ListeningMode mode) {
 
     listening_mode_ = mode;
     const State current = state_machine_.state();
+    if (current == State::Connecting) {
+        // Desired-state update while DNS/TCP/TLS or the server hello is still
+        // pending. The eventual hello enters this latest listening mode.
+        return true;
+    }
     if (current == State::Speaking) {
         const std::string active_session = session_id_;
         if (!abortSpeaking(AbortReason::None)) {
@@ -351,6 +356,13 @@ bool Client::abortSpeaking(AbortReason reason) {
     if (end_requested_) {
         return false;
     }
+    if (begun_ && !ending_ && transport_.asynchronous() &&
+        state_machine_.state() == State::Connecting) {
+        // Abort is also the user's cancel intent while the network task is in
+        // DNS/TCP/TLS. closeSession() changes desired state immediately; a late
+        // connect result is discarded by AsyncTransport's generation barrier.
+        return closeSession();
+    }
     if (!begun_ || ending_ || !session_ready_ ||
         state_machine_.state() != State::Speaking) {
         reportError(ErrorCode::InvalidState, "abortSpeaking requires an active speaking session");
@@ -380,6 +392,10 @@ bool Client::wakeWordDetected(const std::string& wake_word) {
 
     const State current = state_machine_.state();
     pending_wake_word_ = wake_word;
+    if (current == State::Connecting) {
+        // Preserve the latest wake intent across a pending connect/reconnect.
+        return true;
+    }
     if (current == State::Idle) {
         return startListening(config_.enable_server_aec &&
                                       config_.enable_voice_barge_in
@@ -572,6 +588,15 @@ bool Client::attachRealtimeControlSink(RealtimeControlSink* sink) {
     return true;
 }
 
+bool Client::setTransportEventNotifier(TransportEventNotifier notifier) {
+    DispatchScope dispatch(*this);
+    if (user_callback_depth_ != 0 || begun_ || begin_in_progress_ || ending_) {
+        return false;
+    }
+    transport_.setEventNotifier(notifier);
+    return true;
+}
+
 void Client::installTransportCallbacks() {
     TransportCallbacks callbacks;
     callbacks.on_open = [this]() { onTransportOpen(); };
@@ -582,6 +607,7 @@ void Client::installTransportCallbacks() {
     callbacks.on_close = [this]() { onTransportClose(); };
     callbacks.on_error =
         [this](const std::string& message) { onTransportError(message); };
+    callbacks.on_reconnecting = [this]() { onTransportReconnecting(); };
     transport_.setCallbacks(std::move(callbacks));
 }
 
@@ -945,6 +971,35 @@ void Client::onTransportError(const std::string& message) {
     }
 }
 
+void Client::onTransportReconnecting() {
+    DispatchScope dispatch(*this);
+    if (!begun_ || end_requested_ || expected_close_ ||
+        !transport_.asynchronous()) {
+        return;
+    }
+    const State current = state_machine_.state();
+    if (current != State::Connecting && current != State::Listening &&
+        current != State::Speaking && !session_ready_ && !awaiting_hello_) {
+        return;
+    }
+
+    // Preserve the desired wake/listening intent, while invalidating every
+    // identifier and deferred send owned by the failed socket generation.
+    std::string pending_wake_word = std::move(pending_wake_word_);
+    setCaptureEnabled(false);
+    cancelPlayback();
+    clearSession();
+    pending_wake_word_ = std::move(pending_wake_word);
+    const State after_clear = state_machine_.state();
+    if (after_clear == State::Listening || after_clear == State::Speaking ||
+        after_clear == State::Connecting) {
+        state_machine_.transitionTo(State::Idle);
+    }
+    if (!end_requested_ && begun_ && state_machine_.state() == State::Idle) {
+        state_machine_.transitionTo(State::Connecting);
+    }
+}
+
 bool Client::connectSession() {
     if (end_requested_) {
         return false;
@@ -1196,6 +1251,12 @@ bool Client::sendTransportBinary(const uint8_t* data, size_t size) {
     --transport_call_depth_;
     transport_send_in_progress_ = false;
     if (!sent) {
+        if (transport_.asynchronous() && transport_.connected()) {
+            // A bounded async audio queue reports backpressure as false. Drop
+            // this packet and let the audio port account it; control/session
+            // state remains usable while the lower-level send is stalled.
+            return false;
+        }
         handleTransportSendFailure("failed to send an audio frame");
         return false;
     }
@@ -1211,6 +1272,11 @@ void Client::handleTransportSendFailure(const char* message) {
         return;
     }
     const State current = state_machine_.state();
+    if (transport_.asynchronous() && !transport_.connected()) {
+        // The network task owns retry. Its reconnect-generation event clears
+        // stale protocol state without turning desired-connected into close.
+        return;
+    }
     const bool active = current == State::Connecting || current == State::Listening ||
                         current == State::Speaking || session_ready_ || awaiting_hello_;
     // A synchronous on_close/on_error may already have reported and cleaned up

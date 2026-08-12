@@ -46,7 +46,8 @@ TFT_eSPI tft(kDisplayWidth, kDisplayHeight);
 lv_obj_t* stateLabel = nullptr;
 lv_obj_t* roleLabel = nullptr;
 lv_obj_t* messageLabel = nullptr;
-xiaozhi::ArduinoWebSocketTransport transport;
+xiaozhi::ArduinoWebSocketTransport network_transport;
+xiaozhi::AsyncTransport transport(network_transport);
 xiaozhi::Client client(transport);
 xiaozhi::ClientRuntime runtime(client);
 
@@ -136,7 +137,7 @@ void setup() {
     return;
   }
 
-  transport.setCACertificate(kRootCa);
+  network_transport.setCACertificate(kRootCa);
   xiaozhi::ClientConfig config;
   config.websocket_url = kWebSocketUrl;
   config.authorization = kToken;

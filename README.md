@@ -136,7 +136,8 @@ callbacks.on_event = [](const xiaozhi::Event& event) {
 ```cpp
 #include <Xiaozhi.h>
 
-xiaozhi::ArduinoWebSocketTransport transport;
+xiaozhi::ArduinoWebSocketTransport network_transport;
+xiaozhi::AsyncTransport transport(network_transport);
 xiaozhi::Client client(transport);
 xiaozhi::ClientRuntime runtime(client);
 
@@ -155,7 +156,7 @@ void setup() {
     Serial.println(error.c_str());
     return;
   }
-  transport.setCACertificate(
+  network_transport.setCACertificate(
       xiaozhi::ArduinoOfficialService::rootCACertificate());
 
   xiaozhi::Callbacks callbacks;
@@ -177,6 +178,8 @@ void loop() {
 ```
 
 推荐 Arduino 应用使用 `ClientRuntime`。它把单写者 `Client`、WebSocket 轮询、协议超时和 `EncodedAudioPort::loop()` 固定在独立 FreeRTOS 任务；普通请求通过有界队列非阻塞提交，stop、abort、wake 和本地 mute 则进入优先于普通命令/MCP 的固定紧急通道。同类紧急意图会合并，wake 保留最新的固定长度内容，因此显示刷新、传感器读取或第三方库偶尔卡住 Arduino `loopTask` 时，小智链路和本地打断仍继续运行。
+
+内置联网示例还使用 `AsyncTransport` 包装 `ArduinoWebSocketTransport`：DNS、TCP/TLS、WebSocket poll 和 socket send 全部在独立网络任务执行，Client/Runtime 只接触有界的 RX/TX 池。网络任务默认优先级 1，低于 Runtime 的 2，因此即使底层调用忙等，本地控制也能抢占。控制文本队列优先于音频队列；音频 TX 池饱和时只拒绝并统计该包，不会关闭会话。断线会切换连接 generation、丢弃旧会话的收发包，并按 250 ms 起步、最大 5 s 的指数退避保持 desired-connected 重连。`close()` 会立即取消 desired state，阻塞中的底层同步 connect 即使稍后才返回，其结果也会按旧 generation 丢弃。`connect_timeout_ms` 明确标记超时尝试；底层 ArduinoWebsockets 的同步 DNS/TLS 调用本身不能被强制终止，但不会再占住 Runtime。池深、尺寸、任务和退避参数都可通过 `AsyncTransportConfig` 调整。包装器启动后，不要从其他任务直接访问被包装的 Transport。
 
 `runtime.loop()` 只限量派发用户回调，默认每次最多 4 个；即使暂时不调用，也只会延迟 UI/日志，不会停止协议和已挂接音频端口。Runtime 为回调按语义分流：state/capture 各使用一个只保留最新值的覆盖槽，wake/event/error 使用独立的有界可靠队列，audio observer 使用可丢弃的 best-effort 队列，绝不会挤占关键事件或影响音频端口的实际播放。Runtime 初始化时还为 MCP、wake、event、完整 audio observer 和 error 分别建立固定 payload 池；提交前先按各自上限检查长度，池耗尽或队列拥塞时按消息类型计数，不在热路径逐条 `new/delete`。池深与长度上限可在 `ClientRuntimeConfig` 调整，未订阅的 observer 不建立对应池；`runtime.stats()` 可查看合并次数、按类型丢弃和队列/池最高水位。不要在 Runtime 活动期间直接调用底层 `client`；改用 `request*` 方法。按键中断可使用 `requestStopListeningFromISR()`、`requestAbortSpeakingFromISR()`、`requestWakeWordDetectedFromISR()` 和 `requestPlaybackMuteFromISR()`；这些接口只发布 pending bit 或固定结构，不在 ISR 中调用协议或音频代码。需要完全自定义调度或同步主机测试时，仍可不创建 Runtime，继续直接使用 `Client::loop()`。
 
@@ -216,7 +219,7 @@ config.enable_voice_barge_in = true;
 
 使用 `ClientRuntime` 时，底层 `Client` 只由 Runtime 任务访问。Arduino 任务和用户回调只能调用 `runtime.request*()`、读取 Runtime 的原子状态快照或调用 `runtime.loop()`；不要混用 `client.loop()` 或其他 Client 控制 API。`runtime.end()` 会等待服务任务退出并完成 Client/音频端口清理；若有限超时返回 `false`，对象仍保持有效，应稍后重试，不能提前销毁 Transport、Client 或音频端口。
 
-`Client::loop()` 是会话的单写者。自定义 `Transport` 可以从 `connect/send/close` 同步派发回调，也可以从其 `loop()` 派发，但所有调用必须在 Client 所在的同一任务，不能从隐藏的 RTOS 任务直接进入 Client。回调产生的协议文本会先进入小型有界队列，在当前 `connect/loop/send` 返回后发送，因此 Transport 不必支持递归 `send`；同步回调链超过上限会关闭会话，不能无限自激。`sendText/sendBinary` 返回前必须消费或复制输入数据，不能保留指针；`close()` 必须幂等、即使 `connected()==false` 也清除旧回调，并允许从同步回调请求（实现可延迟到当前调用栈退出后再销毁对象）。硬件中断和音频任务应先写入自己的有界队列，再由音频端口的 `loop()` 交给 Client；音频端口的 `end()` 返回前必须停止工作任务和全部上行回调。状态机本身带锁，并在释放锁后通知监听器，避免重入死锁。
+`Client::loop()` 是会话的单写者。同步自定义 `Transport` 可以从 `connect/send/close` 同步派发回调，也可以从其 `loop()` 派发，但所有调用必须在 Client 所在的同一任务，不能从隐藏的 RTOS 任务直接进入 Client；`AsyncTransport` 是受控例外，它在网络任务复制数据，但只从 Client 调用的 `loop()` 派发回调。回调产生的协议文本会先进入小型有界队列，在当前 `connect/loop/send` 返回后发送，因此同步 Transport 不必支持递归 `send`；同步回调链超过上限会关闭会话，不能无限自激。`sendText/sendBinary` 返回前必须消费或复制输入数据，不能保留指针；`close()` 必须幂等并建立代际屏障，旧连接不能在新连接开始后派发回调。硬件中断和音频任务应先写入自己的有界队列，再由音频端口的 `loop()` 交给 Client；音频端口的 `end()` 返回前必须停止工作任务和全部上行回调。状态机本身带锁，并在释放锁后通知监听器，避免重入死锁。
 
 直接使用 Client 时，用户回调中不要调用 `startListening()`、`closeSession()`、`sendMcp()` 等控制 API；为防止递归状态转换，这些调用会返回失败。可以设置 sketch 标志并在 `client.loop()` 返回后执行。使用 Runtime 时则可从回调提交 `runtime.request*()`。
 

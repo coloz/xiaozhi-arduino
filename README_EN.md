@@ -144,7 +144,8 @@ the screen and animation path can be tested first.
 ```cpp
 #include <Xiaozhi.h>
 
-xiaozhi::ArduinoWebSocketTransport transport;
+xiaozhi::ArduinoWebSocketTransport network_transport;
+xiaozhi::AsyncTransport transport(network_transport);
 xiaozhi::Client client(transport);
 xiaozhi::ClientRuntime runtime(client);
 
@@ -165,7 +166,7 @@ void setup() {
     Serial.println(error.c_str());
     return;
   }
-  transport.setCACertificate(
+  network_transport.setCACertificate(
       xiaozhi::ArduinoOfficialService::rootCACertificate());
 
   xiaozhi::Callbacks callbacks;
@@ -188,6 +189,8 @@ void loop() {
 ```
 
 `ClientRuntime` is recommended for Arduino applications. It keeps the single-writer `Client`, WebSocket polling, protocol timeouts, and `EncodedAudioPort::loop()` on a dedicated FreeRTOS task. Normal requests use a bounded queue, while stop, abort, wake, and local mute use a fixed urgent channel that runs before normal commands. A temporarily slow display refresh, sensor read, or third-party library on Arduino's `loopTask` therefore does not stop the Xiaozhi data path or local interruption controls.
+
+The built-in network examples also wrap `ArduinoWebSocketTransport` in `AsyncTransport`. DNS, TCP/TLS, WebSocket polling, and socket sends run on a separate network task; Client/Runtime sees only bounded RX/TX pools. Its default priority 1 is below Runtime's 2, so local controls can preempt even a lower-level busy wait. Control text has priority over audio; a saturated audio TX pool rejects and counts only that packet instead of closing the session. A disconnect advances the connection generation, discards old-session RX/TX, and preserves desired-connected retry with exponential backoff from 250 ms to 5 s. `close()` cancels desired state immediately; if a blocking synchronous connect returns later, its old-generation result is discarded. `connect_timeout_ms` explicitly classifies timed-out attempts. ArduinoWebsockets' synchronous DNS/TLS call itself cannot be forcibly terminated, but it no longer occupies Runtime. Configure pools, size limits, task placement, and backoff with `AsyncTransportConfig`. Do not access the wrapped Transport from another task after the wrapper has started.
 
 `runtime.loop()` only dispatches a bounded number of user callbacks (four by default). Delaying it postpones UI/log callbacks but does not stop protocol or attached-audio servicing. Callbacks are routed by semantics: state and capture each overwrite a latest-value slot; wake, event, and error use a separate bounded reliable queue; audio observers use a best-effort queue that can drop observations without crowding critical events or dropping actual playback. Runtime uses fixed payload pools for large callback and command data. `runtime.stats()` exposes coalescing, typed drops, pool exhaustion, and queue/pool high-water marks. Do not call the underlying `client` while its Runtime is active. Code that needs fully custom scheduling or deterministic synchronous tests can omit Runtime and continue to drive `Client::loop()` directly.
 
@@ -225,7 +228,7 @@ Set both fields to `false` for half-duplex `AutoStop`. Set `XIAOZHI_ALLOW_UNTIME
 
 With `ClientRuntime`, only its service task accesses the underlying `Client`. Arduino tasks and user callbacks must use `runtime.request*()`, read Runtime's atomic state snapshots, or call `runtime.loop()`; do not mix in `client.loop()` or Client control calls. `runtime.end()` waits for service-task exit and Client/audio teardown. If a finite timeout returns `false`, the Runtime is still valid: retry later and do not destroy its Transport, Client, or audio port early.
 
-`Client::loop()` is the sole writer for the session. A custom `Transport` may dispatch callbacks synchronously from `connect/send/close` or from its `loop()`, but every call must run on the same task as Client and never enter Client from a hidden RTOS task. Protocol text produced by a callback is kept in a small bounded queue and sent after the active `connect/loop/send` returns, so a Transport need not support recursive `send`; an overlong synchronous callback chain closes the session instead of self-triggering forever. `sendText/sendBinary` must consume or copy their input before returning and must not retain the pointer. `close()` must be idempotent, quiesce old callbacks even when `connected()==false`, and accept a request from a synchronous callback (destruction may be deferred until the active call unwinds). Hardware interrupts and audio tasks should first write to their own bounded queues, which the audio port's `loop()` then passes to Client; an audio port's `end()` must stop its workers and all uplink callbacks before returning. The state machine itself is protected by a lock and notifies listeners only after releasing it, preventing reentrant deadlocks.
+`Client::loop()` is the sole writer for the session. A synchronous custom `Transport` may dispatch callbacks from `connect/send/close` or `loop()`, but every call must run on the Client task and never enter Client from a hidden RTOS task. `AsyncTransport` is the controlled exception: its network task copies data, while callbacks are dispatched only from the `loop()` call made by Client. Protocol text produced by a callback is kept in a small bounded queue and sent after the active `connect/loop/send` returns, so a synchronous Transport need not support recursive `send`; an overlong callback chain closes the session instead of self-triggering forever. `sendText/sendBinary` must consume or copy their input before returning and must not retain the pointer. `close()` must be idempotent and establish a generation barrier so an old connection cannot dispatch after a new one begins. Hardware interrupts and audio tasks should first write to their own bounded queues, which the audio port's `loop()` then passes to Client; an audio port's `end()` must stop its workers and all uplink callbacks before returning. The state machine itself is protected by a lock and notifies listeners only after releasing it, preventing reentrant deadlocks.
 
 When using Client directly, do not call control APIs such as `startListening()`, `closeSession()`, or `sendMcp()` from a user callback. These calls fail to prevent recursive state transitions. Set a sketch flag and act after `client.loop()` returns. With Runtime, callbacks may instead submit `runtime.request*()` operations.
 

@@ -39,7 +39,8 @@ SET_LOOP_TASK_STACK_SIZE(16 * 1024);
 // XIAOZHI_AUDIO_BOARD selects only microphone/speaker wiring. Display and UI
 // GPIO remain application-owned.
 TFT_eSPI tft;
-xiaozhi::ArduinoWebSocketTransport transport;
+xiaozhi::ArduinoWebSocketTransport network_transport;
+xiaozhi::AsyncTransport transport(network_transport);
 
 const I2sOpusAudioPort::Config audioConfig =
     xiaozhi_audio_board::makeConfig();
@@ -488,7 +489,8 @@ void setup() {
                   provisioning.activation.code.c_str());
   }
 
-  transport.setCACertificate(xiaozhi::ArduinoOfficialService::rootCACertificate());
+  network_transport.setCACertificate(
+      xiaozhi::ArduinoOfficialService::rootCACertificate());
 
   xiaozhi::Callbacks callbacks;
   callbacks.on_wake_word = [](const std::string& wakeWord) {

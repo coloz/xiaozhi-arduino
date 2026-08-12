@@ -13,6 +13,7 @@
 #endif
 
 #include "xiaozhi/ArduinoWebSocketTransport.h"
+#include "xiaozhi/AsyncTransport.h"
 #include "xiaozhi/Audio.h"
 #include "xiaozhi/Client.h"
 #include "xiaozhi/ClientRuntime.h"

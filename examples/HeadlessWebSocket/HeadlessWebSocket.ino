@@ -28,7 +28,8 @@ REPLACE_WITH_YOUR_SERVER_ROOT_CA
 -----END CERTIFICATE-----
 )PEM";
 
-xiaozhi::ArduinoWebSocketTransport transport;
+xiaozhi::ArduinoWebSocketTransport network_transport;
+xiaozhi::AsyncTransport transport(network_transport);
 xiaozhi::Client client(transport);
 xiaozhi::ClientRuntime runtime(client);
 }  // namespace
@@ -40,7 +41,7 @@ void setup() {
     delay(250);
   }
 
-  transport.setCACertificate(kRootCa);
+  network_transport.setCACertificate(kRootCa);
 
   xiaozhi::ClientConfig config;
   config.websocket_url = kWebSocketUrl;

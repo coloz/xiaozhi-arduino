@@ -96,7 +96,8 @@ SET_LOOP_TASK_STACK_SIZE(16 * 1024);
 
 TFT_eSPI tft;
 TftRobotEyes eyes(tft, TftRobotEyes::PLAIN_BASIC);
-xiaozhi::ArduinoWebSocketTransport transport;
+xiaozhi::ArduinoWebSocketTransport network_transport;
+xiaozhi::AsyncTransport transport(network_transport);
 
 I2sOpusAudioPort::Config makeAudioConfig() {
   I2sOpusAudioPort::Config config = xiaozhi_audio_board::makeConfig();
@@ -447,7 +448,7 @@ void setup() {
 #endif
     return;
   }
-  transport.setCACertificate(
+  network_transport.setCACertificate(
       xiaozhi::ArduinoOfficialService::rootCACertificate());
 
   xiaozhi::Callbacks callbacks;

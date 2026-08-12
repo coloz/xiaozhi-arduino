@@ -20,35 +20,54 @@ struct TransportCallbacks {
     std::function<void(const uint8_t* data, size_t size)> on_binary;
     std::function<void()> on_close;
     std::function<void(const std::string& message)> on_error;
+    // An asynchronous transport emits this when a socket generation is lost
+    // but desired-connected state remains true and retry will continue.
+    std::function<void()> on_reconnecting;
+};
+
+// Cross-task notification used by asynchronous transports. The callback must
+// be non-blocking and must not call Transport or Client directly.
+struct TransportEventNotifier {
+    using Notify = void (*)(void* context);
+
+    Notify notify = nullptr;
+    void* context = nullptr;
 };
 
 class Transport {
 public:
     virtual ~Transport() = default;
 
-    // Client and Transport methods are single-task APIs. Implementations may
-    // dispatch callbacks synchronously from connect/send/close or from loop(),
-    // but always on that same task. Client defers protocol sends until an active
-    // connect/loop/send method returns, so Transport methods need not support
-    // recursive send calls.
+    // A synchronous implementation dispatches callbacks on the Client task.
+    // An implementation that returns asynchronous()==true owns the cross-task
+    // copying and dispatches queued callbacks only when Client calls loop().
     virtual void setCallbacks(TransportCallbacks callbacks) = 0;
-    // connect() itself is synchronous: true means the connection is usable and
-    // on_open has been dispatched before return; false means no callback from
-    // that failed attempt may arrive later. Protocol hello remains asynchronous.
+    // For a synchronous transport, true means the connection is usable and
+    // on_open was dispatched before return. For an asynchronous transport, true
+    // means bounded connect work was accepted and on_open arrives later via
+    // loop(). false never permits a late callback from that rejected request.
     virtual bool connect(const TransportRequest& request) = 0;
     virtual void loop() = 0;
     // send* must consume or copy data before returning and must not retain the
-    // pointer. Client reuses its binary framing buffer on the next audio packet.
+    // pointer. For an asynchronous transport, true means copied into bounded TX
+    // ownership, not that the socket write has completed.
     virtual bool sendText(const uint8_t* data, size_t size) = 0;
     virtual bool sendBinary(const uint8_t* data, size_t size) = 0;
-    // close() is idempotent and must quiesce the old connection before returning,
-    // even when connected() is already false. It may dispatch one or more
-    // synchronous terminal callbacks, but must not deliver a late callback from
-    // that connection after a subsequent connect() begins. Client can request
-    // close() from any such callback; an implementation may defer destruction
-    // until its active method unwinds, as ArduinoWebSocketTransport does.
+    // close() is idempotent and is a callback-generation barrier even when
+    // connected() is already false. It must not expose a late callback from the
+    // old connection after a later connect() begins. A synchronous transport
+    // quiesces the socket before returning; an async wrapper may let its worker
+    // unwind a blocking call later, but must discard that old-generation result.
     virtual void close() = 0;
     virtual bool connected() const = 0;
+
+    // Async implementations accept connect/send work into bounded queues and
+    // dispatch their callbacks later from loop(). Synchronous custom transports
+    // keep the original contract and need not override these hooks.
+    virtual bool asynchronous() const { return false; }
+    virtual void setEventNotifier(TransportEventNotifier notifier) {
+        (void)notifier;
+    }
 };
 
 }  // namespace xiaozhi

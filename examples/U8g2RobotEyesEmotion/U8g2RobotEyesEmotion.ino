@@ -44,7 +44,8 @@ U8G2_SSD1306_128X64_NONAME_F_SW_I2C display(
     U8G2_R0, XIAOZHI_U8G2_CLOCK_PIN, XIAOZHI_U8G2_DATA_PIN,
     U8X8_PIN_NONE);
 U8g2RobotEyes eyes(display);
-xiaozhi::ArduinoWebSocketTransport transport;
+xiaozhi::ArduinoWebSocketTransport network_transport;
+xiaozhi::AsyncTransport transport(network_transport);
 
 namespace {
 
@@ -162,7 +163,7 @@ void setup() {
                   provisioning.activation.code.c_str(),
                   provisioning.activation.message.c_str());
   }
-  transport.setCACertificate(
+  network_transport.setCACertificate(
       xiaozhi::ArduinoOfficialService::rootCACertificate());
 
   xiaozhi::Callbacks callbacks;

@@ -418,6 +418,7 @@ private:
         ToggleChat,
         CloseSession,
         SendMcp,
+        TransportReady,
     };
 
     struct Command {
@@ -596,6 +597,21 @@ private:
 
     static void serviceTaskEntry(void* argument) {
         static_cast<Impl*>(argument)->serviceTask();
+    }
+
+    static void transportEventReady(void* context) {
+        static_cast<Impl*>(context)->notifyTransportReady();
+    }
+
+    void notifyTransportReady() {
+        if (command_queue_ == nullptr || stop_requested_.load()) {
+            return;
+        }
+        Command command;
+        command.type = CommandType::TransportReady;
+        // If the queue is full, another command has already made the Runtime
+        // runnable and its normal Client::loop() pass will drain transport RX.
+        xQueueSend(command_queue_, &command, 0);
     }
 
     bool validConfig(const ClientRuntimeConfig& config) const {
@@ -923,7 +939,12 @@ private:
 
     void serviceTask() {
         const bool sink_attached = client_.attachRealtimeControlSink(this);
-        const bool begun = sink_attached &&
+        TransportEventNotifier notifier;
+        notifier.notify = transportEventReady;
+        notifier.context = this;
+        const bool notifier_attached =
+            sink_attached && client_.setTransportEventNotifier(notifier);
+        const bool begun = notifier_attached &&
                            client_.begin(std::move(client_config_),
                                          makeDeferredCallbacks());
         // client_config_ only bridges the caller and service tasks. Client now
@@ -964,6 +985,10 @@ private:
             }
             discardCommands();
             client_.end();
+        }
+
+        if (notifier_attached) {
+            client_.setTransportEventNotifier({});
         }
 
         if (sink_attached) {
@@ -1038,9 +1063,8 @@ private:
         const State current = client_.state();
         if (!client_.ready() ||
             (current != State::Idle && current != State::Listening &&
-             current != State::Speaking)) {
-            // Connecting and other transient states already represent a wake
-            // in progress; consume duplicates without generating Client errors.
+             current != State::Speaking && current != State::Connecting)) {
+            // Other transient states cannot retain a voice-session wake intent.
             ++wake_events_rejected_;
             ++urgent_controls_rejected_;
             return;
@@ -1286,6 +1310,9 @@ private:
     }
 
     void executeCommand(const Command& command) {
+        if (command.type == CommandType::TransportReady) {
+            return;
+        }
         bool accepted = false;
         switch (command.type) {
             case CommandType::StartListening:
@@ -1300,6 +1327,8 @@ private:
             case CommandType::SendMcp:
                 accepted = client_.sendMcp(
                     mcp_command_pool_.at(command.payload_slot).payload);
+                break;
+            case CommandType::TransportReady:
                 break;
         }
         ++commands_executed_;
