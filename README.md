@@ -179,11 +179,11 @@ void loop() {
 
 推荐 Arduino 应用使用 `ClientRuntime`。它把单写者 `Client`、WebSocket 轮询、协议超时和 `EncodedAudioPort::loop()` 固定在独立 FreeRTOS 任务；普通请求通过有界队列非阻塞提交，stop、abort、wake 和本地 mute 则进入优先于普通命令/MCP 的固定紧急通道。同类紧急意图会合并，wake 保留最新的固定长度内容，因此显示刷新、传感器读取或第三方库偶尔卡住 Arduino `loopTask` 时，小智链路和本地打断仍继续运行。
 
-内置联网示例还使用 `AsyncTransport` 包装 `ArduinoWebSocketTransport`：DNS、TCP/TLS、WebSocket poll 和 socket send 全部在独立网络任务执行，Client/Runtime 只接触有界的 RX/TX 池。网络任务默认优先级 1，低于 Runtime 的 2，因此即使底层调用忙等，本地控制也能抢占。控制文本队列优先于音频队列；音频 TX 池饱和时只拒绝并统计该包，不会关闭会话。断线会切换连接 generation、丢弃旧会话的收发包，并按 250 ms 起步、最大 5 s 的指数退避保持 desired-connected 重连。`close()` 会立即取消 desired state，阻塞中的底层同步 connect 即使稍后才返回，其结果也会按旧 generation 丢弃。`connect_timeout_ms` 明确标记超时尝试；底层 ArduinoWebsockets 的同步 DNS/TLS 调用本身不能被强制终止，但不会再占住 Runtime。池深、尺寸、任务和退避参数都可通过 `AsyncTransportConfig` 调整。包装器启动后，不要从其他任务直接访问被包装的 Transport。
+内置联网示例还使用 `AsyncTransport` 包装 `ArduinoWebSocketTransport`：DNS、TCP/TLS、WebSocket poll 和 socket send 全部在独立网络任务执行，Client/Runtime 只接触有界的 RX/TX 池。网络任务默认优先级 1，低于 Runtime 的 2，因此即使底层调用忙等，本地控制也能抢占。控制文本队列优先于音频队列；音频 TX 池饱和时只拒绝并统计该包，不会关闭会话。断线会切换连接 generation、丢弃旧会话的收发包，并按 250 ms 起步、最大 5 s 的指数退避保持 desired-connected 重连。`close()` 会立即取消 desired state，阻塞中的底层同步 connect 即使稍后才返回，其结果也会按旧 generation 丢弃。`connect_timeout_ms` 明确标记超时尝试；底层 ArduinoWebsockets 的同步 DNS/TLS 调用本身不能被强制终止，但不会再占住 Runtime。池深、容量上限、任务和退避参数都可通过 `AsyncTransportConfig` 调整；Client 启动时还会把 `ClientConfig` 的精确文本 wire 上限及“Opus payload + v2/v3 协议头”的二进制 wire 上限逐层传给 wrapper 和底层 Transport，超过预分配容量会拒绝启动。`transport.stats()` 提供 connect、poll、send 与 RX dispatch 最近 64 次的 P50/P95 和生命周期 max；超限统计保留最近一次的 RX/TX 来源、文本/二进制类型、实际长度、限制和时间戳。包装器启动后，不要从其他任务直接访问被包装的 Transport。
 
 `runtime.loop()` 只限量派发用户回调，默认每次最多 4 个；即使暂时不调用，也只会延迟 UI/日志，不会停止协议和已挂接音频端口。Runtime 为回调按语义分流：state/capture 各使用一个只保留最新值的覆盖槽，wake/event/error 使用独立的有界可靠队列，audio observer 使用可丢弃的 best-effort 队列，绝不会挤占关键事件或影响音频端口的实际播放。Runtime 初始化时还为 MCP、wake、event、完整 audio observer 和 error 分别建立固定 payload 池；提交前先按各自上限检查长度，池耗尽或队列拥塞时按消息类型计数，不在热路径逐条 `new/delete`。池深与长度上限可在 `ClientRuntimeConfig` 调整，未订阅的 observer 不建立对应池；`runtime.stats()` 可查看合并次数、按类型丢弃和队列/池最高水位。不要在 Runtime 活动期间直接调用底层 `client`；改用 `request*` 方法。按键中断可使用 `requestStopListeningFromISR()`、`requestAbortSpeakingFromISR()`、`requestWakeWordDetectedFromISR()` 和 `requestPlaybackMuteFromISR()`；这些接口只发布 pending bit 或固定结构，不在 ISR 中调用协议或音频代码。需要完全自定义调度或同步主机测试时，仍可不创建 Runtime，继续直接使用 `Client::loop()`。
 
-默认 Runtime 使用 8192 字节栈、优先级 2、固定到 core 0。搭配 `AsyncTransport` 和内置 I2S 音频端口时，Runtime 不再按固定 2 ms 主动轮询：普通命令、紧急控制、wake、Transport RX、音频上行和播放进度都会发送 task notification；无事件时，等待时间取 Client handshake/channel deadline 与播放 watchdog deadline 的最小值，没有 deadline 就持续休眠。`AsyncTransport` 的重连 timer 由网络任务等待，到期产生的连接事件再通知 Runtime。同步 Transport 或未实现 `EncodedAudioPort::eventDriven()` 的旧音频扩展会自动使用 `poll_interval_ms` 兼容轮询；播放 watchdog 到期但硬件仍在排空时，才使用 `idle_poll_interval_ms` 复查。双核 Arduino 通常把 `loopTask` 放在 core 1，因此默认值能隔离大多数用户代码；单核芯片的有效 core 仍是 0。只需要统计或显示下行音频时，优先设置 `on_audio_meta`，它只跨任务传递时间戳、Opus 字节数和音频格式；只有确实需要读取 Opus 内容时才设置 `on_audio`，后者会从固定池复制 payload。已经挂接 `EncodedAudioPort` 时，observer 拥塞只丢观察回调，不会丢实际播放数据。
+默认 Runtime 使用 8192 字节栈、优先级 2、固定到 core 0。搭配 `AsyncTransport` 和内置 I2S 音频端口时，Runtime 不再按固定 2 ms 主动轮询：普通命令、紧急控制、wake、Transport RX、音频上行和播放进度都会发送 task notification；无事件时，等待时间取 Client handshake/channel deadline 与播放 watchdog deadline 的最小值，没有 deadline 就持续休眠。`AsyncTransport` 的重连 timer 由网络任务等待，到期产生的连接事件再通知 Runtime。同步 Transport 或未实现 `EncodedAudioPort::eventDriven()` 的旧音频扩展会自动使用 `poll_interval_ms` 兼容轮询；播放 watchdog 到期但硬件仍在排空时，才使用 `idle_poll_interval_ms` 复查。Runtime 默认把单次服务轮预算设为 5000 µs，`runtime.stats()` 提供生命周期 max 和超预算次数；该计时包含紧急控制、命令、`Client::loop()` 与 RX dispatch，不包含后续任务等待。双核 Arduino 通常把 `loopTask` 放在 core 1，因此默认值能隔离大多数用户代码；单核芯片的有效 core 仍是 0。只需要统计或显示下行音频时，优先设置 `on_audio_meta`，它只跨任务传递时间戳、Opus 字节数和音频格式；只有确实需要读取 Opus 内容时才设置 `on_audio`，后者会从固定池复制 payload。已经挂接 `EncodedAudioPort` 时，observer 拥塞只丢观察回调，不会丢实际播放数据。
 
 `Event` 默认只保留已解析的 STT、TTS、emotion、alert 等语义字段，不复制原始协议 JSON。调试或自定义协议确实需要原文时，可显式设置 `ClientConfig::include_raw_event_json = true`，并用 `maximum_raw_event_json_bytes` 设置不大于 `max_json_bytes` 的严格上限；超限事件仍提供语义字段，但 `event.json` 为空。
 
@@ -225,14 +225,14 @@ config.enable_voice_barge_in = true;
 
 ## 安全和资源限制
 
-- `ClientConfig` 可以限制 JSON 和 Opus payload 大小，默认分别为 8192 和 4096 字节。
+- `ClientConfig` 可以限制 JSON 和 Opus payload 大小，默认分别为 8192 和 4096 字节；Transport 的二进制限制会自动加上所选协议的 wire header。
 - v2/v3 二进制头使用显式大端读写，拒绝截断、伪造长度和超大 payload，不修改接收缓冲区。
 - MCP 参数进行类型、必填、默认值和整数范围校验；错误文本由 ArduinoJson 转义。
 - `user_only` MCP 工具默认拒绝远端调用；只有本地 UI 通过 `setUserToolAuthorizer()` 明确授权后才能执行。
 - Provisioning HTTP 由调用者传入 `NetworkClient`。HTTPS 时应传入已配置 CA 的 `NetworkClientSecure`。
 - 内置 WebSocket 适配器不提供关闭 TLS 证书校验的开关。
 
-内置适配器把 ArduinoWebsockets 0.5.x 设为逐分片通知，并用总长 16384 字节的缓冲区自行重组；超过上限或分片顺序错误会立即关闭连接，因此不会让依赖库无限聚合整条消息。ArduinoWebsockets 0.5.4 的策略 setter 不会重建已有 StreamBuilder，所以每个新 client 的首条分片消息仍会在依赖内短暂保留第二份；单个 WebSocket 帧也仍由依赖库在回调前分配。连接不可信端点时，应以 `_WS_CONFIG_MAX_MESSAGE_SIZE=16384` 构建 ArduinoWebsockets，或注入一个在读取阶段就限长的自定义 `Transport`。
+内置适配器把 ArduinoWebsockets 0.5.x 设为逐分片通知，并按 Client 下传的文本/二进制上限分别重组；累计超限或分片顺序错误会立即关闭连接。适配器自身容量硬上限为 16384 字节。ArduinoWebsockets 0.5.4 的策略 setter 不会重建已有 StreamBuilder，所以每个新 client 的首条分片消息仍会在依赖内短暂保留第二份；单个 WebSocket 帧也仍由依赖库在回调前分配。连接不可信端点时，构建 ArduinoWebsockets 必须设置 `_WS_CONFIG_MAX_MESSAGE_SIZE`，其值不得小于运行时所需的最大 wire frame 且不得超过 16384；例如当前完整示例使用 `compiler.cpp.extra_flags=-D_WS_CONFIG_MAX_MESSAGE_SIZE=16384`。若该编译期值也对适配器源码可见，`setLimits()` 会拒绝更大的运行时配置；否则仍由适配器在回调后执行运行时限制。也可注入一个在读取阶段就限长的自定义 `Transport`。
 
 ## 当前兼容范围
 

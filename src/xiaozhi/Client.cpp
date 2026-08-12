@@ -68,6 +68,18 @@ bool Client::beginOwned(ClientConfig&& config, Callbacks callbacks) {
         return false;
     }
 
+    TransportLimits transport_limits;
+    transport_limits.maximum_text_frame_bytes = config.max_json_bytes;
+    transport_limits.maximum_binary_frame_bytes =
+        Protocol::maximumAudioFrameBytes(config.protocol_version,
+                                         config.max_audio_payload_bytes);
+    if (!transport_.setLimits(transport_limits)) {
+        callbacks_ = std::move(callbacks);
+        reportError(ErrorCode::InvalidConfiguration,
+                    "transport cannot enforce the configured frame limits");
+        return false;
+    }
+
     config_ = std::move(config);
     deferred_text_sends_.clear();
     deferred_text_sends_.reserve(kMaximumDeferredTextSends);
@@ -904,6 +916,13 @@ void Client::onTransportBinary(const uint8_t* data, size_t size) {
     if (!begun_ || end_requested_ || !session_ready_) {
         return;
     }
+    if (size > Protocol::maximumAudioFrameBytes(
+                   config_.protocol_version,
+                   config_.max_audio_payload_bytes)) {
+        reportError(ErrorCode::InvalidAudioFrame,
+                    "incoming binary frame exceeds the configured wire limit");
+        return;
+    }
     AudioFrameView view;
     std::string error;
     if (!Protocol::parseAudioView(config_.protocol_version, data, size,
@@ -1279,6 +1298,14 @@ bool Client::drainDeferredTextSends() {
 }
 
 bool Client::sendTransportBinary(const uint8_t* data, size_t size) {
+    if (data == nullptr || size == 0 ||
+        size > Protocol::maximumAudioFrameBytes(
+                   config_.protocol_version,
+                   config_.max_audio_payload_bytes)) {
+        reportError(ErrorCode::InvalidAudioFrame,
+                    "outgoing binary frame exceeds the configured wire limit");
+        return false;
+    }
     if (!transport_.connected()) {
         handleTransportSendFailure("audio transport is disconnected");
         return false;

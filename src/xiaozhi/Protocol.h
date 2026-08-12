@@ -19,6 +19,8 @@ struct ServerHello {
 class Protocol {
 public:
     static bool validateConfig(const ClientConfig& config, std::string& error);
+    static size_t maximumAudioFrameBytes(uint8_t version,
+                                         size_t maximum_payload_bytes);
 
     static bool makeHello(const ClientConfig& config, std::string& output,
                           std::string& error);

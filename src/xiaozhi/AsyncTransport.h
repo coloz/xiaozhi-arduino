@@ -37,6 +37,8 @@ struct AsyncTransportConfig {
     uint8_t maximum_control_sends_per_cycle = 4;
     uint8_t maximum_events_per_loop = 4;
 
+    // Capacity ceilings. Client installs its exact wire limits before begin;
+    // begin fails if they exceed these preallocated pool capacities.
     size_t maximum_text_bytes = 8192;
     size_t maximum_binary_bytes = 4112;
     size_t maximum_error_bytes = 256;
@@ -55,6 +57,12 @@ struct AsyncTransportStats {
     uint32_t receive_binary_dropped = 0;
     uint32_t transmit_control_rejected = 0;
     uint32_t transmit_audio_rejected = 0;
+    TransportLimitStats frame_limits;
+    // Rolling percentiles use the latest 64 samples; max is lifetime.
+    TransportTimingSummary connect_timing;
+    TransportTimingSummary poll_timing;
+    TransportTimingSummary send_timing;
+    TransportTimingSummary receive_dispatch_timing;
 };
 
 // Runs an existing synchronous Transport on a dedicated network task. Client
@@ -71,6 +79,7 @@ public:
     AsyncTransport& operator=(const AsyncTransport&) = delete;
 
     void setCallbacks(TransportCallbacks callbacks) override;
+    bool setLimits(const TransportLimits& limits) override;
     // true means the desired connection request was accepted. on_open is
     // dispatched later from loop() after the network task has connected.
     bool connect(const TransportRequest& request) override;
@@ -85,6 +94,7 @@ public:
     bool connected() const override;
     bool asynchronous() const override { return true; }
     void setEventNotifier(TransportEventNotifier notifier) override;
+    TransportLimitStats limitStats() const override;
 
     // Stops the network task and quiesces the wrapped transport. A finite
     // timeout that returns false leaves the object active and safe to retry.

@@ -7,6 +7,7 @@
 #include <esp_timer.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cstring>
 #include <limits>
@@ -30,9 +31,59 @@ TickType_t timeoutTicks(uint32_t timeout_ms) {
     return std::max<TickType_t>(1, pdMS_TO_TICKS(timeout_ms));
 }
 
-uint32_t nowMs() {
-    return static_cast<uint32_t>(esp_timer_get_time() / 1000);
+uint32_t elapsedUs(int64_t started_us) {
+    const int64_t elapsed = std::max<int64_t>(0, esp_timer_get_time() - started_us);
+    return static_cast<uint32_t>(std::min<int64_t>(
+        elapsed, std::numeric_limits<uint32_t>::max()));
 }
+
+class TimingWindow {
+public:
+    void record(uint32_t elapsed_us) {
+        const uint32_t index = writes_.load(std::memory_order_relaxed);
+        values_[index % values_.size()].store(elapsed_us,
+                                              std::memory_order_relaxed);
+        uint32_t previous = maximum_.load(std::memory_order_relaxed);
+        while (elapsed_us > previous &&
+               !maximum_.compare_exchange_weak(previous, elapsed_us,
+                                                std::memory_order_relaxed)) {
+        }
+        // Publish the completed sample only after both its slot and lifetime
+        // maximum are visible to a concurrent stats() snapshot.
+        writes_.store(index + 1U, std::memory_order_release);
+    }
+
+    TransportTimingSummary summary() const {
+        TransportTimingSummary result;
+        const uint32_t writes = writes_.load(std::memory_order_acquire);
+        result.samples = writes;
+        result.max_us = maximum_.load(std::memory_order_relaxed);
+        const size_t count = std::min<size_t>(writes, values_.size());
+        if (count == 0) {
+            return result;
+        }
+        std::array<uint32_t, 64> ordered{};
+        const uint32_t first = writes - static_cast<uint32_t>(count);
+        for (size_t index = 0; index < count; ++index) {
+            ordered[index] =
+                values_[(first + index) % values_.size()].load(
+                    std::memory_order_relaxed);
+        }
+        std::sort(ordered.begin(), ordered.begin() + count);
+        result.p50_us = ordered[percentileIndex(count, 50)];
+        result.p95_us = ordered[percentileIndex(count, 95)];
+        return result;
+    }
+
+private:
+    static size_t percentileIndex(size_t count, size_t percentile) {
+        return ((count * percentile + 99U) / 100U) - 1U;
+    }
+
+    std::array<std::atomic<uint32_t>, 64> values_{};
+    std::atomic<uint32_t> writes_{0};
+    std::atomic<uint32_t> maximum_{0};
+};
 
 struct PayloadSlot {
     std::vector<uint8_t> bytes;
@@ -125,7 +176,9 @@ struct TransmitMessage {
 class AsyncTransport::Impl {
 public:
     Impl(Transport& transport, const AsyncTransportConfig& config)
-        : transport_(transport), config_(config) {}
+        : transport_(transport),
+          config_(config),
+          limits_{config.maximum_text_bytes, config.maximum_binary_bytes} {}
 
     ~Impl() {
         end(std::numeric_limits<uint32_t>::max());
@@ -133,6 +186,27 @@ public:
 
     void setCallbacks(TransportCallbacks callbacks) {
         callbacks_ = std::move(callbacks);
+    }
+
+    bool setLimits(const TransportLimits& limits) {
+        if (limits.maximum_text_frame_bytes == 0 ||
+            limits.maximum_binary_frame_bytes == 0 ||
+            limits.maximum_text_frame_bytes > config_.maximum_text_bytes ||
+            limits.maximum_binary_frame_bytes > config_.maximum_binary_bytes) {
+            return false;
+        }
+        if (task_active_.load(std::memory_order_acquire)) {
+            return limits.maximum_text_frame_bytes ==
+                       limits_.maximum_text_frame_bytes &&
+                   limits.maximum_binary_frame_bytes ==
+                       limits_.maximum_binary_frame_bytes;
+        }
+        if (!transport_.setLimits(limits)) {
+            return false;
+        }
+        limits_ = limits;
+        limits_forwarded_ = true;
+        return true;
     }
 
     bool connect(const TransportRequest& request) {
@@ -170,7 +244,9 @@ public:
                 break;
             }
             if (event.generation == generation) {
+                const int64_t started_us = esp_timer_get_time();
                 dispatchEvent(event);
+                receive_dispatch_timing_.record(elapsedUs(started_us));
             }
             releaseEvent(event);
         }
@@ -244,12 +320,37 @@ public:
         result.receive_binary_dropped = receive_binary_dropped_.load();
         result.transmit_control_rejected = transmit_control_rejected_.load();
         result.transmit_audio_rejected = transmit_audio_rejected_.load();
+        result.frame_limits = combinedLimitStats();
+        result.connect_timing = connect_timing_.summary();
+        result.poll_timing = poll_timing_.summary();
+        result.send_timing = send_timing_.summary();
+        result.receive_dispatch_timing = receive_dispatch_timing_.summary();
+        return result;
+    }
+
+    TransportLimitStats combinedLimitStats() const {
+        TransportLimitStats result = transport_.limitStats();
+        const uint32_t own_count = limit_violations_.load();
+        result.violations += own_count;
+        const uint64_t own_timestamp = latest_limit_timestamp_us_.load(
+            std::memory_order_acquire);
+        if (own_count != 0 && own_timestamp >= result.latest_timestamp_us) {
+            result.latest_source = static_cast<TransportLimitSource>(
+                latest_limit_source_.load());
+            result.latest_type = static_cast<TransportPayloadType>(
+                latest_limit_type_.load());
+            result.latest_length = latest_limit_length_.load();
+            result.latest_limit = latest_limit_value_.load();
+            result.latest_timestamp_us = own_timestamp;
+        }
         return result;
     }
 
 private:
     Transport& transport_;
     AsyncTransportConfig config_;
+    TransportLimits limits_;
+    bool limits_forwarded_ = false;
     TransportCallbacks callbacks_;
     TransportRequest desired_request_;
     TransportRequest worker_request_;
@@ -295,6 +396,18 @@ private:
     std::atomic<uint32_t> receive_binary_dropped_{0};
     std::atomic<uint32_t> transmit_control_rejected_{0};
     std::atomic<uint32_t> transmit_audio_rejected_{0};
+    std::atomic<uint32_t> limit_violations_{0};
+    std::atomic<uint8_t> latest_limit_source_{
+        static_cast<uint8_t>(TransportLimitSource::None)};
+    std::atomic<uint8_t> latest_limit_type_{
+        static_cast<uint8_t>(TransportPayloadType::None)};
+    std::atomic<size_t> latest_limit_length_{0};
+    std::atomic<size_t> latest_limit_value_{0};
+    std::atomic<uint64_t> latest_limit_timestamp_us_{0};
+    TimingWindow connect_timing_;
+    TimingWindow poll_timing_;
+    TimingWindow send_timing_;
+    TimingWindow receive_dispatch_timing_;
 
     bool validConfig() const {
         return config_.task_stack_size >= 4096 && config_.task_priority > 0 &&
@@ -336,6 +449,12 @@ private:
         if (!validConfig()) {
             return false;
         }
+        if (!limits_forwarded_) {
+            if (!transport_.setLimits(limits_)) {
+                return false;
+            }
+            limits_forwarded_ = true;
+        }
         releaseResources();
         control_event_queue_ = xQueueCreate(config_.control_event_queue_depth,
                                              sizeof(EventMessage));
@@ -351,16 +470,16 @@ private:
             control_tx_queue_ == nullptr || audio_tx_queue_ == nullptr ||
             request_mutex_ == nullptr || stopped_signal_ == nullptr ||
             !receive_text_pool_.initialize(config_.receive_text_pool_depth,
-                                           config_.maximum_text_bytes) ||
+                                           limits_.maximum_text_frame_bytes) ||
             !receive_binary_pool_.initialize(config_.receive_binary_pool_depth,
-                                             config_.maximum_binary_bytes) ||
+                                             limits_.maximum_binary_frame_bytes) ||
             !receive_error_pool_.initialize(config_.receive_error_pool_depth,
                                             config_.maximum_error_bytes) ||
             !transmit_control_pool_.initialize(
                 config_.transmit_control_pool_depth,
-                config_.maximum_text_bytes) ||
+                limits_.maximum_text_frame_bytes) ||
             !transmit_audio_pool_.initialize(config_.transmit_audio_pool_depth,
-                                             config_.maximum_binary_bytes)) {
+                                             limits_.maximum_binary_frame_bytes)) {
             releaseResources();
             return false;
         }
@@ -440,13 +559,20 @@ private:
                 worker_generation_ != active_generation_.load()) {
                 return;
             }
-            if (size > config_.maximum_text_bytes ||
+            if (size > limits_.maximum_text_frame_bytes ||
                 !enqueuePayloadEvent(EventType::Text, worker_generation_, data,
                                      size, receive_text_pool_,
                                      control_event_queue_)) {
                 ++receive_text_dropped_;
+                if (size > limits_.maximum_text_frame_bytes) {
+                    recordLimitViolation(TransportLimitSource::Receive,
+                                         TransportPayloadType::Text, size,
+                                         limits_.maximum_text_frame_bytes);
+                }
                 enqueueError(worker_generation_,
-                             "asynchronous text receive pool is full or oversized");
+                             size > limits_.maximum_text_frame_bytes
+                                 ? "asynchronous receive text frame exceeds its limit"
+                                 : "asynchronous text receive pool is full");
                 worker_fatal_error_ = true;
                 worker_connection_lost_ = true;
             }
@@ -456,12 +582,15 @@ private:
                 worker_generation_ != active_generation_.load()) {
                 return;
             }
-            if (size > config_.maximum_binary_bytes ||
+            if (size > limits_.maximum_binary_frame_bytes ||
                 !enqueuePayloadEvent(EventType::Binary, worker_generation_, data,
                                      size, receive_binary_pool_,
                                      audio_event_queue_)) {
                 ++receive_binary_dropped_;
-                if (size > config_.maximum_binary_bytes) {
+                if (size > limits_.maximum_binary_frame_bytes) {
+                    recordLimitViolation(TransportLimitSource::Receive,
+                                         TransportPayloadType::Binary, size,
+                                         limits_.maximum_binary_frame_bytes);
                     enqueueError(worker_generation_,
                                  "asynchronous binary receive exceeds its limit");
                     worker_fatal_error_ = true;
@@ -515,10 +644,12 @@ private:
                 worker_generation_ = desired_generation;
                 worker_connection_lost_ = false;
                 worker_fatal_error_ = false;
-                const uint32_t started_ms = nowMs();
+                const int64_t started_us = esp_timer_get_time();
                 const bool opened = transport_.connect(worker_request_);
-                const uint32_t elapsed_ms = nowMs() - started_ms;
-                const bool timed_out = elapsed_ms > config_.connect_timeout_ms;
+                const uint32_t elapsed_us = elapsedUs(started_us);
+                connect_timing_.record(elapsed_us);
+                const bool timed_out =
+                    elapsed_us > config_.connect_timeout_ms * 1000ULL;
                 const bool canceled = stop_requested_.load() ||
                                       !desired_connected_.load() ||
                                       active_generation_.load() != desired_generation;
@@ -552,7 +683,9 @@ private:
             bool send_failed = false;
             serviceTransmits(send_failed);
             if (!send_failed && worker_connected_) {
+                const int64_t started_us = esp_timer_get_time();
                 transport_.loop();
+                poll_timing_.record(elapsedUs(started_us));
             }
             if (send_failed || worker_connection_lost_ ||
                 !transport_.connected()) {
@@ -642,7 +775,11 @@ private:
             }
             if (message.generation == worker_generation_ && worker_connected_) {
                 PayloadSlot& slot = transmit_control_pool_.at(message.payload_slot);
-                if (!transport_.sendText(slot.bytes.data(), slot.bytes.size())) {
+                const int64_t started_us = esp_timer_get_time();
+                const bool sent =
+                    transport_.sendText(slot.bytes.data(), slot.bytes.size());
+                send_timing_.record(elapsedUs(started_us));
+                if (!sent) {
                     failed = true;
                 } else {
                     ++control_messages_sent_;
@@ -658,7 +795,11 @@ private:
         if (xQueueReceive(audio_tx_queue_, &audio, 0) == pdTRUE) {
             if (audio.generation == worker_generation_ && worker_connected_) {
                 PayloadSlot& slot = transmit_audio_pool_.at(audio.payload_slot);
-                if (!transport_.sendBinary(slot.bytes.data(), slot.bytes.size())) {
+                const int64_t started_us = esp_timer_get_time();
+                const bool sent =
+                    transport_.sendBinary(slot.bytes.data(), slot.bytes.size());
+                send_timing_.record(elapsedUs(started_us));
+                if (!sent) {
                     failed = true;
                 } else {
                     ++audio_messages_sent_;
@@ -671,9 +812,16 @@ private:
     bool enqueueTransmit(const uint8_t* data, size_t size, bool binary) {
         const bool invalid = data == nullptr || size == 0 ||
                              !task_active_.load() || !connected();
-        const size_t maximum = binary ? config_.maximum_binary_bytes
-                                      : config_.maximum_text_bytes;
+        const size_t maximum =
+            binary ? limits_.maximum_binary_frame_bytes
+                   : limits_.maximum_text_frame_bytes;
         if (invalid || size > maximum) {
+            if (!invalid && size > maximum) {
+                recordLimitViolation(TransportLimitSource::Transmit,
+                                     binary ? TransportPayloadType::Binary
+                                            : TransportPayloadType::Text,
+                                     size, maximum);
+            }
             if (binary) {
                 ++transmit_audio_rejected_;
             } else {
@@ -801,6 +949,19 @@ private:
         notifyClient();
     }
 
+    void recordLimitViolation(TransportLimitSource source,
+                              TransportPayloadType type, size_t length,
+                              size_t limit) {
+        latest_limit_source_.store(static_cast<uint8_t>(source));
+        latest_limit_type_.store(static_cast<uint8_t>(type));
+        latest_limit_length_.store(length);
+        latest_limit_value_.store(limit);
+        latest_limit_timestamp_us_.store(
+            static_cast<uint64_t>(esp_timer_get_time()),
+            std::memory_order_release);
+        limit_violations_.fetch_add(1);
+    }
+
     void dispatchEvent(const EventMessage& event) {
         switch (event.type) {
             case EventType::Open:
@@ -914,6 +1075,10 @@ void AsyncTransport::setCallbacks(TransportCallbacks callbacks) {
     impl_->setCallbacks(std::move(callbacks));
 }
 
+bool AsyncTransport::setLimits(const TransportLimits& limits) {
+    return impl_->setLimits(limits);
+}
+
 bool AsyncTransport::connect(const TransportRequest& request) {
     return impl_->connect(request);
 }
@@ -940,6 +1105,10 @@ bool AsyncTransport::connected() const {
 
 void AsyncTransport::setEventNotifier(TransportEventNotifier notifier) {
     impl_->setEventNotifier(notifier);
+}
+
+TransportLimitStats AsyncTransport::limitStats() const {
+    return impl_->combinedLimitStats();
 }
 
 bool AsyncTransport::end(uint32_t timeout_ms) {

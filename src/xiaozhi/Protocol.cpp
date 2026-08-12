@@ -104,6 +104,17 @@ bool validWebSocketUrl(const std::string& url) {
 
 }  // namespace
 
+size_t Protocol::maximumAudioFrameBytes(uint8_t version,
+                                        size_t maximum_payload_bytes) {
+    if (version == 2) {
+        return maximum_payload_bytes + kProtocol2HeaderSize;
+    }
+    if (version == 3) {
+        return maximum_payload_bytes + kProtocol3HeaderSize;
+    }
+    return maximum_payload_bytes;
+}
+
 bool Protocol::validateConfig(const ClientConfig& config, std::string& error) {
     if (config.websocket_url.size() > 2048 || hasHeaderControlCharacter(config.websocket_url) ||
         (config.websocket_url.rfind("ws://", 0) != 0 &&

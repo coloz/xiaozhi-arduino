@@ -74,6 +74,9 @@ struct ClientRuntimeConfig {
     ClientRuntimePlaybackWatchdogConfig playback_watchdog;
     // Kept after the original fields so aggregate initialization remains valid.
     uint8_t audio_callback_queue_depth = 2;
+    // Measures urgent controls, bounded commands, Client::loop(), RX dispatch,
+    // and snapshots in one service turn; the subsequent task wait is excluded.
+    uint32_t maximum_service_cycle_us = 5000;
 };
 
 struct ClientRuntimeStats {
@@ -116,6 +119,8 @@ struct ClientRuntimeStats {
     uint32_t state_callbacks_coalesced = 0;
     uint32_t capture_callbacks_coalesced = 0;
     uint8_t audio_callback_queue_high_watermark = 0;
+    uint32_t service_cycle_overruns = 0;
+    uint32_t service_cycle_maximum_us = 0;
 };
 
 class ClientRuntime {

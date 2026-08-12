@@ -408,6 +408,8 @@ public:
         output.callback_queue_high_watermark = callback_queue_high_watermark_.load();
         output.audio_callback_queue_high_watermark =
             audio_callback_queue_high_watermark_.load();
+        output.service_cycle_overruns = service_cycle_overruns_.load();
+        output.service_cycle_maximum_us = service_cycle_maximum_us_.load();
         return output;
     }
 
@@ -566,6 +568,8 @@ private:
     std::atomic<uint8_t> command_queue_high_watermark_{0};
     std::atomic<uint8_t> callback_queue_high_watermark_{0};
     std::atomic<uint8_t> audio_callback_queue_high_watermark_{0};
+    std::atomic<uint32_t> service_cycle_overruns_{0};
+    std::atomic<uint32_t> service_cycle_maximum_us_{0};
 
     // Owned exclusively by the Runtime service task. uint32_t subtraction is
     // intentionally wrap-safe across the Arduino millisecond counter rollover.
@@ -635,6 +639,8 @@ private:
                config.idle_poll_interval_ms <= 1000 &&
                config.command_queue_depth > 0 && config.callback_queue_depth > 0 &&
                config.audio_callback_queue_depth > 0 &&
+               config.maximum_service_cycle_us > 0 &&
+               config.maximum_service_cycle_us <= 1000000 &&
                config.maximum_commands_per_cycle > 0 &&
                config.mcp_command_pool_depth > 0 &&
                config.mcp_command_pool_depth <= 32 &&
@@ -1019,6 +1025,7 @@ private:
 
         if (begun) {
             while (!stop_requested_.load()) {
+                const int64_t cycle_started_us = esp_timer_get_time();
                 processUrgentControls();
                 servicePlaybackWatchdog();
                 processCommands();
@@ -1027,6 +1034,16 @@ private:
                 }
                 client_.loop();
                 snapshotClient();
+                const uint32_t cycle_elapsed_us = static_cast<uint32_t>(
+                    std::min<int64_t>(
+                        std::max<int64_t>(0, esp_timer_get_time() -
+                                                cycle_started_us),
+                        std::numeric_limits<uint32_t>::max()));
+                updateMaximum(service_cycle_maximum_us_, cycle_elapsed_us);
+                if (cycle_elapsed_us >
+                    runtime_config_.maximum_service_cycle_us) {
+                    ++service_cycle_overruns_;
+                }
                 ++service_cycles_;
                 ulTaskNotifyTake(pdTRUE, timeoutTicks(nextServiceDelayMs()));
             }
@@ -1514,6 +1531,8 @@ private:
         command_queue_high_watermark_.store(0);
         callback_queue_high_watermark_.store(0);
         audio_callback_queue_high_watermark_.store(0);
+        service_cycle_overruns_.store(0);
+        service_cycle_maximum_us_.store(0);
     }
 };
 
