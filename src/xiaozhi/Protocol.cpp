@@ -207,7 +207,11 @@ bool Protocol::parseServerHello(const uint8_t* data, size_t size, ServerHello& o
         return false;
     }
 
-    JsonObjectConst root = document.as<JsonObjectConst>();
+    return parseServerHello(document.as<JsonObjectConst>(), output, error);
+}
+
+bool Protocol::parseServerHello(JsonObjectConst root, ServerHello& output,
+                                std::string& error) {
     if (root.isNull() || !jsonStringEquals(root["type"], "hello")) {
         error = "server hello has an invalid type";
         return false;

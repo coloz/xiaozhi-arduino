@@ -42,6 +42,15 @@ Client::~Client() {
 }
 
 bool Client::begin(const ClientConfig& config, Callbacks callbacks) {
+    ClientConfig owned = config;
+    return beginOwned(std::move(owned), std::move(callbacks));
+}
+
+bool Client::begin(ClientConfig&& config, Callbacks callbacks) {
+    return beginOwned(std::move(config), std::move(callbacks));
+}
+
+bool Client::beginOwned(ClientConfig&& config, Callbacks callbacks) {
     DispatchScope dispatch(*this);
     if (user_callback_depth_ != 0) {
         return false;
@@ -58,7 +67,7 @@ bool Client::begin(const ClientConfig& config, Callbacks callbacks) {
         return false;
     }
 
-    config_ = config;
+    config_ = std::move(config);
     deferred_text_sends_.clear();
     deferred_text_sends_.reserve(kMaximumDeferredTextSends);
     deferred_text_bytes_ = 0;
@@ -642,7 +651,7 @@ void Client::onTransportText(const uint8_t* data, size_t size) {
         }
         ServerHello hello;
         std::string error;
-        if (!Protocol::parseServerHello(data, size, hello, error)) {
+        if (!Protocol::parseServerHello(root, hello, error)) {
             reportError(ErrorCode::InvalidMessage, error);
             closeSession();
             return;
@@ -842,6 +851,12 @@ void Client::onTransportBinary(const uint8_t* data, size_t size) {
          state_machine_.state() != State::Speaking)) {
         return;
     }
+    // The transport bytes remain valid for this callback. Give the playback
+    // port the borrowed view first so an implementation can copy once into its
+    // own fixed worker pool without an intermediate AudioFrame allocation.
+    if (audio_port_started_ && audio_port_ != nullptr) {
+        audio_port_->play(view);
+    }
     if (callbacks_.on_audio_meta) {
         AudioFrameMeta meta;
         meta.format = view.format;
@@ -854,8 +869,7 @@ void Client::onTransportBinary(const uint8_t* data, size_t size) {
             return;
         }
     }
-    if (!callbacks_.on_audio &&
-        (!audio_port_started_ || audio_port_ == nullptr)) {
+    if (!callbacks_.on_audio) {
         return;
     }
     AudioFrame frame;
@@ -869,9 +883,6 @@ void Client::onTransportBinary(const uint8_t* data, size_t size) {
         if (end_requested_ || !begun_ || !session_ready_) {
             return;
         }
-    }
-    if (audio_port_started_ && audio_port_ != nullptr) {
-        audio_port_->play(std::move(frame));
     }
 }
 

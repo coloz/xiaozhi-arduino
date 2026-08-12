@@ -27,8 +27,15 @@ class MyAudioPort final : public xiaozhi::EncodedAudioPort {
   }
   void setCaptureEnabled(bool enabled) override { capture_enabled_ = enabled; }
   void play(const xiaozhi::AudioFrame& frame) override {
-    // Decode frame.opus, resample from frame.format.sample_rate if needed, and play.
-    last_downlink_size_ = frame.opus.size();
+    const xiaozhi::AudioFrameView view{
+        frame.format, frame.timestamp, frame.opus.data(), frame.opus.size()};
+    play(view);
+  }
+  void play(const xiaozhi::AudioFrameView& frame) override {
+    // frame.opus is borrowed only until this call returns. Decode it now, or
+    // synchronously copy it into a bounded worker buffer before returning.
+    // Never retain the pointer in an asynchronous queue.
+    last_downlink_size_ = frame.opus_size;
   }
 
  private:

@@ -188,9 +188,9 @@ Runtime 默认还会监控 TTS 播放：进入 `Speaking` 后 12 秒未收到首
 
 更推荐实现 `EncodedAudioPort` 并在 `runtime.begin()` 前调用 `client.attachAudioPort(&port)`，让音频扩展处理 Opus 编解码和硬件队列。未使用音频端口的高级用法可直接用 `Client` 的同步 API 管理手工上行帧。
 
-`EncodedAudioPort` 还提供可选的移动播放、`cancelPlayback()` 和 `queuedPlaybackMs()` 钩子；旧扩展无需修改即可继续编译。实现取消钩子后，用户打断、TTS 新轮次、会话关闭或网络断开会立即废弃旧播放数据，避免缓冲语音继续播出。
+`EncodedAudioPort` 还提供借用式 `play(const AudioFrameView&)`、移动播放、`cancelPlayback()` 和 `queuedPlaybackMs()` 钩子；旧扩展无需修改即可继续编译。借用视图中的 Opus 指针只在 `play()` 调用期间有效，自定义端口若要异步解码，必须在返回前同步复制到自己的有界缓冲。实现取消钩子后，用户打断、TTS 新轮次、会话关闭或网络断开会立即废弃旧播放数据，避免缓冲语音继续播出。
 
-完整的 `TftEsPiDisplay` 音频示例将 I2S 采集、Opus 编解码和 I2S 输出放在独立任务中，Runtime 任务限量批量转交已编码的上行包，并让上行先于一次可能批量处理消息的 WebSocket 轮询。四条热路径队列使用预分配固定环，PCM 缓冲池复用；Opus 编码只保留一个最大尺寸临时缓冲，排队包按实际编码长度占用内存。采集下采样使用按实际比例生成的 15-tap Q15 滤波器，48→24 kHz 播放使用流式 31-tap Q15 滤波器，上采样采用跨包连续的单样本延迟因果插值。上下行压缩包队列默认与官方 2.4.0 一致保留最多 2400 ms，既吸收 Wi-Fi/服务器突发，又在用户手动打断时由代际号立即废弃全部旧包。会话仍连接时示例关闭 Wi-Fi 省电，以降低首包和连续对话抖动。设备端 ESP-SR AFE/AEC 仍是板级扩展，必须按真实回声参考路径单独实现和验证。
+完整的 `TftEsPiDisplay` 音频示例将 I2S 采集、Opus 编解码和 I2S 输出放在独立任务中，Runtime 任务限量批量转交已编码的上行包，并让上行先于一次可能批量处理消息的 WebSocket 轮询。四条热路径队列使用预分配固定环；PCM 与下行 Opus 缓冲在启动时分配，上行 Opus 容器在首次编码后留在固定池中复用。下行从网络借用视图直接复制一次到解码池，暖机后不再为每包分配内存。默认下行池允许 42 个排队包、每包最大 1275 字节，并同时受 2400 ms 延迟上限约束；可通过 `maximumDecodePackets`、`maximumDownlinkOpusBytes` 和 `maximumDecodeQueueMs` 调整。采集下采样使用按实际比例生成的 15-tap Q15 滤波器，48→24 kHz 播放使用流式 31-tap Q15 滤波器，上采样采用跨包连续的单样本延迟因果插值。上下行有界队列既吸收 Wi-Fi/服务器突发，又在用户手动打断时由代际号立即废弃全部旧包。会话仍连接时示例关闭 Wi-Fi 省电，以降低首包和连续对话抖动。设备端 ESP-SR AFE/AEC 仍是板级扩展，必须按真实回声参考路径单独实现和验证。
 
 为兼容 2.4.0 原实现，`protocol_version` 默认是 1。核心 `ClientConfig` 默认请求服务端 AEC/语音打断，但完整 TFT 示例只在服务端实际下发协议 v2 时启用 `Realtime`：v2 会把“已实际写入 I2S 的下行包时间戳”配给上行帧。v1/v3 没有该字段，实体测试会把扬声器回声误判为插话、造成回复只播几个字，因此示例自动回退 `AutoStop`，保证回复完整；BOOT 键、串口 `t` 和 `abortSpeaking()` 仍可立即手动打断。
 

@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <utility>
 #include <vector>
 
 #include "Types.h"
@@ -64,6 +65,18 @@ public:
     // encoded payload without another allocation. Existing ports remain source
     // compatible through the const-reference fallback.
     virtual void play(AudioFrame&& frame) { play(frame); }
+    // Client prefers this borrowed view so a port can copy directly into a
+    // preallocated worker buffer. The pointer expires when this call returns;
+    // the compatibility fallback creates an owning frame synchronously.
+    virtual void play(const AudioFrameView& frame) {
+        AudioFrame owned;
+        owned.format = frame.format;
+        owned.timestamp = frame.timestamp;
+        if (frame.opus != nullptr && frame.opus_size != 0) {
+            owned.opus.assign(frame.opus, frame.opus + frame.opus_size);
+        }
+        play(std::move(owned));
+    }
     // Stop locally queued/in-flight playback after a user abort, disconnect, or
     // new TTS generation. Implementations should be idempotent and non-blocking
     // apart from the short synchronization needed to invalidate old work.

@@ -24,6 +24,9 @@ public:
     Client& operator=(const Client&) = delete;
 
     bool begin(const ClientConfig& config, Callbacks callbacks = {});
+    // Runtime can transfer its startup-only configuration instead of retaining
+    // a second copy after Client has initialized.
+    bool begin(ClientConfig&& config, Callbacks callbacks = {});
     void end();
     void loop();
 
@@ -129,6 +132,7 @@ private:
     std::vector<uint8_t> audio_send_buffer_;
 
     void installTransportCallbacks();
+    bool beginOwned(ClientConfig&& config, Callbacks callbacks);
     void onTransportOpen();
     void onTransportText(const uint8_t* data, size_t size);
     void onTransportBinary(const uint8_t* data, size_t size);

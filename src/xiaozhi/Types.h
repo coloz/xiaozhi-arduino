@@ -73,6 +73,15 @@ struct AudioFrame {
     std::vector<uint8_t> opus;
 };
 
+// Non-owning encoded frame. The bytes are borrowed only for the duration of
+// the receiving call and must be copied or consumed synchronously.
+struct AudioFrameView {
+    AudioFormat format;
+    uint32_t timestamp = 0;
+    const uint8_t* opus = nullptr;
+    size_t opus_size = 0;
+};
+
 struct AudioFrameMeta {
     AudioFormat format;
     uint32_t timestamp = 0;

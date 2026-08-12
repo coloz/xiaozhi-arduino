@@ -924,7 +924,12 @@ private:
     void serviceTask() {
         const bool sink_attached = client_.attachRealtimeControlSink(this);
         const bool begun = sink_attached &&
-                           client_.begin(client_config_, makeDeferredCallbacks());
+                           client_.begin(std::move(client_config_),
+                                         makeDeferredCallbacks());
+        // client_config_ only bridges the caller and service tasks. Client now
+        // owns the reconnect fields, so keep no duplicate strings in Runtime.
+        ClientConfig empty_client_config;
+        std::swap(client_config_, empty_client_config);
         startup_succeeded_.store(begun);
         running_.store(begun);
         snapshotClient();

@@ -354,6 +354,13 @@ class I2sOpusAudioPort final : public xiaozhi::EncodedAudioPort {
     uint32_t wakeTaskStackBytes = 8 * 1024;
     uint8_t wakeTaskPriority = 5;
     int wakeTaskCore = 0;
+
+    // Fixed downlink ownership budget. 1275 bytes is the maximum legal Opus
+    // packet size. The queue has maximumDecodePackets slots, the pool has one
+    // extra buffer for the decoder, and maximumDecodeQueueMs remains the
+    // independent latency bound.
+    size_t maximumDecodePackets = 42;
+    size_t maximumDownlinkOpusBytes = 1275;
   };
 
   explicit I2sOpusAudioPort(const Config& config);
@@ -368,6 +375,7 @@ class I2sOpusAudioPort final : public xiaozhi::EncodedAudioPort {
   void setCaptureEnabled(bool enabled) override;
   void play(const xiaozhi::AudioFrame& frame) override;
   void play(xiaozhi::AudioFrame&& frame) override;
+  void play(const xiaozhi::AudioFrameView& frame) override;
   void cancelPlayback() override;
   bool playbackIdle() const override;
   bool setPlaybackMuted(bool muted) override;

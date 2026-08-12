@@ -314,6 +314,7 @@ struct I2sOpusAudioPort::Impl {
   i2s_opus_detail::FixedRingQueue<UplinkPacket> uplinkQueue;
   std::vector<std::vector<uint8_t>> uplinkPool;
   i2s_opus_detail::FixedRingQueue<DecodePacket> decodeQueue;
+  std::vector<std::vector<uint8_t>> decodePool;
   i2s_opus_detail::FixedRingQueue<PlaybackChunk> playbackQueue;
   std::vector<std::vector<int16_t>> playbackPool;
   SemaphoreHandle_t queueMutex = nullptr;
@@ -1188,10 +1189,8 @@ struct I2sOpusAudioPort::Impl {
     capturePool.clear();
     uplinkQueue.reset(config.maximumUplinkPackets);
     uplinkPool.clear();
-    // Protocol and bundled codec both accept 10/20/40/60 ms frames. Two spare
-    // slots leave room for the decoder task and a concurrently arriving frame.
-    decodeQueue.reset(
-        std::max<size_t>(2, config.maximumDecodeQueueMs / 10 + 2));
+    decodeQueue.reset(config.maximumDecodePackets);
+    decodePool.clear();
     playbackQueue.reset(config.maximumPlaybackChunks);
     playbackPool.clear();
     clearPlaybackTimestampsLocked();
@@ -1217,12 +1216,18 @@ struct I2sOpusAudioPort::Impl {
 
     capturePool.reserve(config.maximumEncodePackets + 1);
     uplinkPool.reserve(config.maximumUplinkPackets + 1);
+    decodePool.reserve(config.maximumDecodePackets + 1);
     playbackPool.reserve(config.maximumPlaybackChunks + 1);
     for (size_t index = 0; index < config.maximumEncodePackets + 1; ++index) {
       capturePool.emplace_back(captureSamplesPerPacket);
     }
     for (size_t index = 0; index < config.maximumUplinkPackets + 1; ++index) {
       uplinkPool.emplace_back();
+    }
+    for (size_t index = 0; index < config.maximumDecodePackets + 1; ++index) {
+      std::vector<uint8_t> buffer;
+      buffer.reserve(config.maximumDownlinkOpusBytes);
+      decodePool.push_back(std::move(buffer));
     }
     encoderScratch.resize(static_cast<size_t>(encoderOutputBytes));
     const size_t maximumPlaybackSamples =
@@ -1597,6 +1602,7 @@ struct I2sOpusAudioPort::Impl {
     playbackQueue.release();
     std::vector<std::vector<int16_t>>().swap(capturePool);
     std::vector<std::vector<uint8_t>>().swap(uplinkPool);
+    std::vector<std::vector<uint8_t>>().swap(decodePool);
     std::vector<std::vector<int16_t>>().swap(playbackPool);
     decodeInFlight = false;
     outputInFlight = false;
@@ -1737,6 +1743,7 @@ struct I2sOpusAudioPort::Impl {
           } else {
             playbackPool.push_back(std::move(chunk.pcm));
           }
+          decodePool.push_back(std::move(packet.frame.opus));
           decodeInFlight = false;
           xSemaphoreGive(queueMutex);
         }
@@ -2492,8 +2499,12 @@ struct I2sOpusAudioPort::Impl {
     return true;
   }
 
-  void enqueueDecode(xiaozhi::AudioFrame frame) {
-    if (!workersRunning.load() || queueMutex == nullptr) {
+  void enqueueDecode(const xiaozhi::AudioFrameView& frame) {
+    if (!workersRunning.load() || queueMutex == nullptr || frame.opus == nullptr ||
+        frame.opus_size == 0 ||
+        frame.opus_size > config.maximumDownlinkOpusBytes) {
+      ++droppedDecodePackets;
+      decoderResetRequested.store(true);
       return;
     }
     bool queued = false;
@@ -2503,23 +2514,51 @@ struct I2sOpusAudioPort::Impl {
         queuedMs += packet.frame.format.frame_duration_ms;
       }
       bool droppedForLatency = false;
-      if (decodeQueue.size() >= decodeQueue.capacity()) {
+      std::vector<uint8_t> buffer;
+      bool haveBuffer = false;
+      const auto dropFront = [&]() {
         queuedMs -= decodeQueue.front().frame.format.frame_duration_ms;
+        if (!haveBuffer) {
+          buffer = std::move(decodeQueue.front().frame.opus);
+          haveBuffer = true;
+        } else {
+          decodePool.push_back(
+              std::move(decodeQueue.front().frame.opus));
+        }
         decodeQueue.pop_front();
         droppedForLatency = true;
         ++droppedDecodePackets;
+      };
+      if (decodeQueue.size() >= decodeQueue.capacity()) {
+        dropFront();
       }
       while (!decodeQueue.empty() &&
              queuedMs + frame.format.frame_duration_ms >
                  config.maximumDecodeQueueMs) {
-        queuedMs -= decodeQueue.front().frame.format.frame_duration_ms;
-        decodeQueue.pop_front();
-        droppedForLatency = true;
+        dropFront();
+      }
+      if (!haveBuffer && !decodePool.empty()) {
+        buffer = std::move(decodePool.back());
+        decodePool.pop_back();
+        haveBuffer = true;
+      }
+      if (!haveBuffer || buffer.capacity() < frame.opus_size) {
+        if (haveBuffer) {
+          decodePool.push_back(std::move(buffer));
+        }
         ++droppedDecodePackets;
+        decoderResetRequested.store(true);
+        xSemaphoreGive(queueMutex);
+        return;
       }
       playbackSuppressed.store(false);
       DecodePacket packet;
-      packet.frame = std::move(frame);
+      packet.frame.format = frame.format;
+      packet.frame.timestamp = frame.timestamp;
+      packet.frame.opus = std::move(buffer);
+      // Every pool buffer reserved maximumDownlinkOpusBytes during begin().
+      // assign() therefore performs only the single transport-to-port copy.
+      packet.frame.opus.assign(frame.opus, frame.opus + frame.opus_size);
       packet.generation = playbackGeneration.load();
       // Opus prediction cannot safely bridge a deliberately dropped packet.
       // Mark the first retained packet after the gap so the codec task resets
@@ -2534,6 +2573,7 @@ struct I2sOpusAudioPort::Impl {
       }
       queued = decodeQueue.push_back(std::move(packet));
       if (!queued) {
+        decodePool.push_back(std::move(packet.frame.opus));
         ++droppedDecodePackets;
         decoderResetRequested.store(true);
       }
@@ -2555,7 +2595,10 @@ struct I2sOpusAudioPort::Impl {
     applyCodecMute(true);
     if (queueMutex != nullptr &&
         xSemaphoreTake(queueMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-      decodeQueue.clear();
+      while (!decodeQueue.empty()) {
+        decodePool.push_back(std::move(decodeQueue.front().frame.opus));
+        decodeQueue.pop_front();
+      }
       while (!playbackQueue.empty()) {
         playbackPool.push_back(std::move(playbackQueue.front().pcm));
         playbackQueue.pop_front();
@@ -2760,6 +2803,9 @@ bool I2sOpusAudioPort::begin(const xiaozhi::AudioFormat& captureFormat, Uplink u
       config.mclkMultiple > 0 &&
       config.dmaDescriptorCount > 0 && config.dmaFrames > 0 &&
       config.readFramesPerLoop > 0 && config.maximumDecodeQueueMs > 0 &&
+      config.maximumDecodePackets > 0 && config.maximumDecodePackets <= 255 &&
+      config.maximumDownlinkOpusBytes > 0 &&
+      config.maximumDownlinkOpusBytes <= 8192 &&
       config.maximumPlaybackChunks > 0 && config.maximumEncodePackets > 0 &&
       config.maximumUplinkPackets > 0 && config.uplinkPacketsPerLoop > 0 &&
       config.inputTaskStackBytes > 0 && config.decoderTaskStackBytes > 0 &&
@@ -2904,13 +2950,23 @@ void I2sOpusAudioPort::setCaptureEnabled(bool enabled) {
 
 void I2sOpusAudioPort::play(const xiaozhi::AudioFrame& frame) {
   if (impl_->started) {
-    impl_->enqueueDecode(xiaozhi::AudioFrame(frame));
+    const xiaozhi::AudioFrameView view{
+        frame.format, frame.timestamp, frame.opus.data(), frame.opus.size()};
+    impl_->enqueueDecode(view);
   }
 }
 
 void I2sOpusAudioPort::play(xiaozhi::AudioFrame&& frame) {
   if (impl_->started) {
-    impl_->enqueueDecode(std::move(frame));
+    const xiaozhi::AudioFrameView view{
+        frame.format, frame.timestamp, frame.opus.data(), frame.opus.size()};
+    impl_->enqueueDecode(view);
+  }
+}
+
+void I2sOpusAudioPort::play(const xiaozhi::AudioFrameView& frame) {
+  if (impl_->started) {
+    impl_->enqueueDecode(frame);
   }
 }
 

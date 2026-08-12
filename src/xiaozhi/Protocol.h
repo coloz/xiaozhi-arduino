@@ -5,6 +5,8 @@
 #include <string>
 #include <vector>
 
+#include <ArduinoJson.h>
+
 #include "Types.h"
 
 namespace xiaozhi {
@@ -14,15 +16,6 @@ struct ServerHello {
     AudioFormat audio;
 };
 
-// Non-owning result used to validate and gate a binary frame before allocating
-// its Opus payload. The view is valid only while the input bytes remain alive.
-struct AudioFrameView {
-    AudioFormat format;
-    uint32_t timestamp = 0;
-    const uint8_t* opus = nullptr;
-    size_t opus_size = 0;
-};
-
 class Protocol {
 public:
     static bool validateConfig(const ClientConfig& config, std::string& error);
@@ -30,6 +23,8 @@ public:
     static bool makeHello(const ClientConfig& config, std::string& output,
                           std::string& error);
     static bool parseServerHello(const uint8_t* data, size_t size, ServerHello& output,
+                                 std::string& error);
+    static bool parseServerHello(JsonObjectConst root, ServerHello& output,
                                  std::string& error);
 
     static bool makeStartListening(const std::string& session_id, ListeningMode mode,
