@@ -42,6 +42,10 @@ struct AsyncTransportConfig {
     size_t maximum_text_bytes = 8192;
     size_t maximum_binary_bytes = 4112;
     size_t maximum_error_bytes = 256;
+    // ESP32 builds that enable external task stacks can keep this relatively
+    // large network/TLS stack in PSRAM, preserving scarce internal SRAM for
+    // mbedTLS handshake allocations. A board without PSRAM must leave it false.
+    bool task_stack_in_psram = false;
 };
 
 struct AsyncTransportStats {

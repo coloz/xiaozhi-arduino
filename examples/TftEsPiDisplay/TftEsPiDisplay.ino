@@ -11,12 +11,20 @@
 #define XIAOZHI_AUDIO_BOARD XIAOZHI_AUDIO_BOARD_OJ_ESP32S3_BASIC
 #endif
 
+// This enclosure/microphone measured reliably at 42 dB without clipping.
+#ifndef BOARD_AUDIO_MIC_GAIN_DB
+#define BOARD_AUDIO_MIC_GAIN_DB 42.0f
+#endif
+
 // Edit the Wi-Fi credentials directly in this sketch.
-#define XIAOZHI_WIFI_SSID "vivoX300"
-#define XIAOZHI_WIFI_PASSWORD "1234567890"
+#define XIAOZHI_WIFI_SSID "mostfun2026"
+#define XIAOZHI_WIFI_PASSWORD "cd85586651"
 
 #include <Arduino.h>
 #include <Xiaozhi.h>
+
+#include <esp_heap_caps.h>
+#include <mbedtls/platform.h>
 
 #include <TFT_eSPI.h>  // Configure the installed library for your display first.
 #include <WiFi.h>
@@ -40,10 +48,37 @@ SET_LOOP_TASK_STACK_SIZE(16 * 1024);
 // GPIO remain application-owned.
 TFT_eSPI tft;
 xiaozhi::ArduinoWebSocketTransport network_transport;
-xiaozhi::AsyncTransport transport(network_transport);
 
-const I2sOpusAudioPort::Config audioConfig =
-    xiaozhi_audio_board::makeConfig();
+xiaozhi::AsyncTransportConfig makeTransportConfig() {
+  xiaozhi::AsyncTransportConfig config;
+  // Allocate for the limits installed below instead of reserving the generic
+  // 8 KiB JSON / 4 KiB audio maxima in every queue slot. The full audio and
+  // WakeNet pipeline leaves about 42 KiB of internal heap on this board.
+  config.control_event_queue_depth = 4;
+  config.receive_text_pool_depth = 1;
+  config.receive_binary_pool_depth = 1;
+  config.transmit_control_pool_depth = 3;
+  config.transmit_audio_pool_depth = 2;
+  config.maximum_text_bytes = 4096;
+  config.maximum_binary_bytes = 1275 + 16;
+  config.task_stack_in_psram = true;
+  return config;
+}
+
+xiaozhi::AsyncTransport transport(network_transport, makeTransportConfig());
+
+I2sOpusAudioPort::Config makeAudioConfig() {
+  I2sOpusAudioPort::Config config = xiaozhi_audio_board::makeConfig();
+  // Measured high-water marks on this board leave more than 7 KiB unused in
+  // both continuous capture and WakeNet tasks. Keep at least 3 KiB here while
+  // returning internal SRAM to the TLS handshake.
+  config.inputTaskStackBytes = 4 * 1024;
+  config.outputTaskStackBytes = 3 * 1024;
+  config.wakeTaskStackBytes = 4 * 1024;
+  return config;
+}
+
+const I2sOpusAudioPort::Config audioConfig = makeAudioConfig();
 I2sOpusAudioPort audioPort(audioConfig);
 
 namespace {
@@ -142,9 +177,49 @@ uint32_t chatButtonChangedMs = 0;
 
 constexpr uint32_t kChatButtonDebounceMs = 40;
 
+void* tlsPsramFirstCalloc(size_t count, size_t size) {
+  if (count != 0 && size > SIZE_MAX / count) {
+    return nullptr;
+  }
+  // Match ESP-IDF's external-memory mbedTLS policy: TLS owns many small
+  // certificate and handshake objects in addition to two ~16 KiB record
+  // buffers. Keeping only the latter in PSRAM still exhausts internal SRAM
+  // during a long audio session and can make the next X.509 verification fail.
+  void* allocation =
+      heap_caps_calloc(count, size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  if (allocation == nullptr) {
+    allocation = heap_caps_calloc(count, size,
+                                  MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+  }
+  return allocation;
+}
+
+void tlsHeapCapsFree(void* allocation) {
+  heap_caps_free(allocation);
+}
+
 bool hasPlaceholderNetworkConfig() {
   return strcmp(kWifiSsid, "YOUR_WIFI_SSID") == 0 ||
          strcmp(kWifiPassword, "YOUR_WIFI_PASSWORD") == 0;
+}
+
+std::string sanitizedWebSocketEndpoint(const std::string& url) {
+  const size_t schemeEnd = url.find("://");
+  if (schemeEnd == std::string::npos) {
+    return "(invalid URL)";
+  }
+  const size_t authorityBegin = schemeEnd + 3;
+  const size_t authorityEnd = url.find_first_of("/?#", authorityBegin);
+  std::string authority = url.substr(
+      authorityBegin, authorityEnd == std::string::npos
+                          ? std::string::npos
+                          : authorityEnd - authorityBegin);
+  // Never expose user-info if a custom endpoint embeds credentials in its URL.
+  const size_t userInfoEnd = authority.rfind('@');
+  if (userInfoEnd != std::string::npos) {
+    authority.erase(0, userInfoEnd + 1);
+  }
+  return url.substr(0, schemeEnd + 3) + authority;
 }
 
 void logConfiguredNetworkScan() {
@@ -459,6 +534,11 @@ void setup() {
 #if XIAOZHI_PROTOCOL_VERSION_OVERRIDE != 0
   config.protocol_version = XIAOZHI_PROTOCOL_VERSION_OVERRIDE;
 #endif
+  // A legal Opus packet is at most 1275 bytes. Four KiB is enough for the
+  // protocol/control JSON used by this terminal while keeping the deferred
+  // asynchronous transport pools within the ESP32-S3's remaining SRAM.
+  config.max_json_bytes = 4096;
+  config.max_audio_payload_bytes = 1275;
   const bool aecRequested = XIAOZHI_ENABLE_SERVER_AEC_DEFAULT != 0;
   const bool timedServerAec = config.protocol_version == 2;
   const bool allowUntimestampedAec =
@@ -474,6 +554,15 @@ void setup() {
   Serial.printf("[xiaozhi] official WebSocket received, protocol v%u, token present=%s\n",
                 config.protocol_version,
                 provisioning.websocket.token.empty() ? "no" : "yes");
+  Serial.printf("[network] WebSocket endpoint: %s\n",
+                sanitizedWebSocketEndpoint(config.websocket_url).c_str());
+  Serial.printf("[network] frame limits: json=%u audio=%u bytes\n",
+                static_cast<unsigned>(config.max_json_bytes),
+                static_cast<unsigned>(config.max_audio_payload_bytes));
+  const int tlsAllocatorResult =
+      mbedtls_platform_set_calloc_free(tlsPsramFirstCalloc, tlsHeapCapsFree);
+  Serial.printf("[network] TLS PSRAM allocator: %s\n",
+                tlsAllocatorResult == 0 ? "enabled" : "failed");
   Serial.printf("[audio] server AEC=%s voice barge-in=%s\n",
                 config.enable_server_aec ? "on" : "off",
                 config.enable_voice_barge_in ? "on" : "off");
@@ -528,6 +617,9 @@ void setup() {
     return;
   }
   xiaozhi::ClientRuntimeConfig runtimeConfig;
+  // The measured idle high-water mark is about 5 KiB free from the default
+  // 8 KiB stack; retain roughly 3 KiB headroom for active protocol handling.
+  runtimeConfig.task_stack_size = 6 * 1024;
   runtimeConfig.lifecycle.on_state_changed =
       [](void*, xiaozhi::State, xiaozhi::State next, bool sessionReady) {
         const bool lowLatencySession = sessionReady ||

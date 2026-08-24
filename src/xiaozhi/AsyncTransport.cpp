@@ -4,6 +4,7 @@
 #include <freertos/queue.h>
 #include <freertos/semphr.h>
 #include <freertos/task.h>
+#include <esp_heap_caps.h>
 #include <esp_timer.h>
 
 #include <algorithm>
@@ -487,19 +488,27 @@ private:
         stop_requested_.store(false);
         task_active_.store(true, std::memory_order_release);
         BaseType_t created = pdFAIL;
+        TaskHandle_t task = nullptr;
+#if defined(CONFIG_FREERTOS_TASK_CREATE_ALLOW_EXT_MEM) && \
+    CONFIG_FREERTOS_TASK_CREATE_ALLOW_EXT_MEM
+        if (config_.task_stack_in_psram) {
+            created = xTaskCreatePinnedToCoreWithCaps(
+                workerTaskEntry, "xiaozhi-net", config_.task_stack_size, this,
+                config_.task_priority, &task,
+                config_.task_core < 0 ? tskNO_AFFINITY : config_.task_core,
+                MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        } else
+#endif
         if (config_.task_core < 0) {
-            TaskHandle_t task = nullptr;
             created = xTaskCreate(workerTaskEntry, "xiaozhi-net",
                                   config_.task_stack_size, this,
                                   config_.task_priority, &task);
-            worker_task_.store(task, std::memory_order_release);
         } else {
-            TaskHandle_t task = nullptr;
             created = xTaskCreatePinnedToCore(
                 workerTaskEntry, "xiaozhi-net", config_.task_stack_size, this,
                 config_.task_priority, &task, config_.task_core);
-            worker_task_.store(task, std::memory_order_release);
         }
+        worker_task_.store(task, std::memory_order_release);
         if (created != pdPASS) {
             task_active_.store(false);
             worker_task_.store(nullptr, std::memory_order_release);
@@ -604,11 +613,18 @@ private:
             }
         };
         callbacks.on_error = [this](const std::string& message) {
-            if (worker_accept_receive_ && worker_connected_) {
-                enqueueError(worker_generation_, message);
-                worker_fatal_error_ = true;
-                worker_connection_lost_ = true;
+            // Synchronous transports can report an error from inside
+            // connect(), before worker_connected_ becomes true. Dropping that
+            // callback leaves Client in Connecting while the worker retries
+            // forever, with no useful error or timeout visible to the caller.
+            if (!desired_connected_.load(std::memory_order_acquire) ||
+                worker_generation_ !=
+                    active_generation_.load(std::memory_order_acquire)) {
+                return;
             }
+            enqueueError(worker_generation_, message);
+            worker_fatal_error_ = true;
+            worker_connection_lost_ = true;
         };
         transport_.setCallbacks(std::move(callbacks));
 
@@ -731,6 +747,12 @@ private:
         task_active_.store(false, std::memory_order_release);
         worker_task_.store(nullptr, std::memory_order_release);
         xSemaphoreGive(stopped_signal_);
+#if defined(CONFIG_FREERTOS_TASK_CREATE_ALLOW_EXT_MEM) && \
+    CONFIG_FREERTOS_TASK_CREATE_ALLOW_EXT_MEM
+        if (config_.task_stack_in_psram) {
+            vTaskDeleteWithCaps(nullptr);
+        } else
+#endif
         vTaskDelete(nullptr);
     }
 
