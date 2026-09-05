@@ -8,7 +8,7 @@
 - ESP32-S3，16 MB Flash，8 MB OPI PSRAM
 - 分区：`ESP SR 16M`（`PartitionScheme=esp_sr_16`）
 - USB CDC On Boot：Enabled，便于查看串口诊断
-- 开发板音频接线由 `.ino` 开头的 `XIAOZHI_AUDIO_BOARD` 直接选择，不需要
+- 开发板音频接线由 `.ino` 开头的 `XIAOZHI_BOARD` 直接选择，不需要
   `BoardConfig.h`；完整选择方法见项目根目录的
   `AUDIO_PROFILES.md`
 - TFT_eSPI 不支持构造函数传入引脚；请在已安装库的 `User_Setup.h` 或构建

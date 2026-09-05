@@ -15,7 +15,6 @@
 #include <new>
 #include <string>
 #include <utility>
-#include <vector>
 
 namespace xiaozhi {
 namespace {
@@ -86,8 +85,33 @@ private:
     std::atomic<uint32_t> maximum_{0};
 };
 
+// Unlike vector::reserve(), allocation failure is recoverable even when the
+// Arduino toolchain disables C++ exceptions. All copies reuse this storage.
+class PayloadBuffer {
+public:
+    bool reserve(size_t capacity) {
+        storage_.reset(new (std::nothrow) uint8_t[capacity]);
+        return storage_ != nullptr;
+    }
+
+    void assign(const uint8_t* first, const uint8_t* last) {
+        size_ = static_cast<size_t>(last - first);
+        if (size_ != 0) {
+            std::memcpy(storage_.get(), first, size_);
+        }
+    }
+
+    void clear() { size_ = 0; }
+    const uint8_t* data() const { return storage_.get(); }
+    size_t size() const { return size_; }
+
+private:
+    std::unique_ptr<uint8_t[]> storage_;
+    size_t size_ = 0;
+};
+
 struct PayloadSlot {
-    std::vector<uint8_t> bytes;
+    PayloadBuffer bytes;
 
     void clear() { bytes.clear(); }
 };
@@ -106,7 +130,10 @@ public:
         }
         capacity_ = capacity;
         for (uint8_t index = 0; index < capacity_; ++index) {
-            slots_[index].bytes.reserve(reserve_bytes);
+            if (!slots_[index].bytes.reserve(reserve_bytes)) {
+                reset();
+                return false;
+            }
         }
         free_mask_.store(capacity == 32 ? std::numeric_limits<uint32_t>::max()
                                         : ((1U << capacity) - 1U));
@@ -164,6 +191,7 @@ enum class EventType : uint8_t {
 struct EventMessage {
     EventType type = EventType::Open;
     uint32_t generation = 0;
+    uint32_t sequence = 0;
     uint8_t payload_slot = kInvalidSlot;
 };
 
@@ -217,16 +245,19 @@ public:
         if (xSemaphoreTake(request_mutex_, portMAX_DELAY) != pdTRUE) {
             return false;
         }
-        desired_request_ = request;
-        xSemaphoreGive(request_mutex_);
-
-        const uint32_t generation =
-            active_generation_.fetch_add(1, std::memory_order_acq_rel) + 1;
-        (void)generation;
+        // Pause the worker until old queues are discarded and the replacement
+        // request is fully published. Otherwise a fast connect can enqueue Open
+        // only for this caller to discard it immediately afterwards.
+        desired_connected_.store(false, std::memory_order_release);
         connected_.store(false, std::memory_order_release);
-        desired_connected_.store(true, std::memory_order_release);
+        active_generation_.fetch_add(1, std::memory_order_acq_rel);
+        desired_request_ = request;
+        discardPendingEvents();
         discardQueuedEvents();
         discardQueuedTransmits();
+        xSemaphoreGive(request_mutex_);
+
+        desired_connected_.store(true, std::memory_order_release);
         notifyWorker();
         return true;
     }
@@ -235,21 +266,58 @@ public:
         if (!task_active_.load(std::memory_order_acquire)) {
             return;
         }
-        const uint32_t generation =
-            active_generation_.load(std::memory_order_acquire);
         for (uint8_t index = 0; index < config_.maximum_events_per_loop;
              ++index) {
-            EventMessage event;
-            if (xQueueReceive(control_event_queue_, &event, 0) != pdTRUE &&
-                xQueueReceive(audio_event_queue_, &event, 0) != pdTRUE) {
+            // Separate capacity pools must not reorder the WebSocket stream:
+            // tts:start, audio, tts:stop has to reach Client in that order.
+            // Own each head until dispatch so a concurrent worker reconnect
+            // cannot discard and replace a message between peek and receive.
+            if (!has_pending_control_) {
+                has_pending_control_ =
+                    xQueueReceive(control_event_queue_, &pending_control_, 0) ==
+                    pdTRUE;
+            }
+            if (!has_pending_audio_) {
+                has_pending_audio_ =
+                    xQueueReceive(audio_event_queue_, &pending_audio_, 0) == pdTRUE;
+            }
+            if (!has_pending_control_ && has_pending_audio_) {
+                // The single producer may have queued control then audio after
+                // our first read. Recheck before choosing the newer audio head.
+                has_pending_control_ =
+                    xQueueReceive(control_event_queue_, &pending_control_, 0) ==
+                    pdTRUE;
+            }
+            if (!has_pending_control_ && !has_pending_audio_) {
                 break;
             }
-            if (event.generation == generation) {
+            const bool control_first =
+                has_pending_control_ &&
+                (!has_pending_audio_ ||
+                 static_cast<int32_t>(pending_control_.sequence -
+                                      pending_audio_.sequence) <= 0);
+            const EventMessage event =
+                control_first ? pending_control_ : pending_audio_;
+            if (control_first) {
+                has_pending_control_ = false;
+            } else {
+                has_pending_audio_ = false;
+            }
+            // Callbacks can close or replace the connection during this batch.
+            if (event.generation ==
+                active_generation_.load(std::memory_order_acquire)) {
                 const int64_t started_us = esp_timer_get_time();
                 dispatchEvent(event);
                 receive_dispatch_timing_.record(elapsedUs(started_us));
             }
             releaseEvent(event);
+        }
+        // Task notifications coalesce. A bounded dispatch must re-arm itself
+        // when work remains, even if no further network packet ever arrives.
+        if (has_pending_control_ || has_pending_audio_ ||
+            uxQueueMessagesWaiting(control_event_queue_) != 0 ||
+            uxQueueMessagesWaiting(audio_event_queue_) != 0) {
+            notifyClient();
         }
     }
 
@@ -271,13 +339,17 @@ public:
             std::swap(desired_request_, empty);
             xSemaphoreGive(request_mutex_);
         }
+        discardPendingEvents();
         discardQueuedEvents();
         discardQueuedTransmits();
         notifyWorker();
     }
 
     bool connected() const {
-        return connected_.load(std::memory_order_acquire);
+        return connected_.load(std::memory_order_acquire) &&
+               desired_connected_.load(std::memory_order_acquire) &&
+               connected_generation_.load(std::memory_order_acquire) ==
+                   active_generation_.load(std::memory_order_acquire);
     }
 
     void setEventNotifier(TransportEventNotifier notifier) {
@@ -293,18 +365,22 @@ public:
         }
         desired_connected_.store(false, std::memory_order_release);
         connected_.store(false, std::memory_order_release);
-        stop_requested_.store(true, std::memory_order_release);
+        if (!stop_requested_.exchange(true, std::memory_order_acq_rel)) {
+            active_generation_.fetch_add(1, std::memory_order_acq_rel);
+        }
         notifyWorker();
         if (stopped_signal_ == nullptr ||
             xSemaphoreTake(stopped_signal_, timeoutTicks(timeout_ms)) != pdTRUE) {
             return false;
         }
+        task_active_.store(false, std::memory_order_release);
         releaseResources();
         return true;
     }
 
     bool running() const {
-        return task_active_.load(std::memory_order_acquire);
+        return task_active_.load(std::memory_order_acquire) &&
+               worker_task_.load(std::memory_order_acquire) != nullptr;
     }
 
     AsyncTransportStats stats() const {
@@ -363,6 +439,12 @@ private:
     SemaphoreHandle_t request_mutex_ = nullptr;
     SemaphoreHandle_t stopped_signal_ = nullptr;
     std::atomic<TaskHandle_t> worker_task_{nullptr};
+    // Owned only by the caller of loop()/connect()/close()/end(). The worker
+    // discards queued generations but never releases these in-flight heads.
+    EventMessage pending_control_;
+    EventMessage pending_audio_;
+    bool has_pending_control_ = false;
+    bool has_pending_audio_ = false;
 
     FixedSlotPool<PayloadSlot> receive_text_pool_;
     FixedSlotPool<PayloadSlot> receive_binary_pool_;
@@ -374,6 +456,7 @@ private:
     std::atomic<bool> stop_requested_{false};
     std::atomic<bool> desired_connected_{false};
     std::atomic<bool> connected_{false};
+    std::atomic<uint32_t> connected_generation_{0};
     std::atomic<uint32_t> active_generation_{0};
     std::atomic<TransportEventNotifier::Notify> notifier_function_{nullptr};
     std::atomic<void*> notifier_context_{nullptr};
@@ -384,6 +467,7 @@ private:
     bool worker_connection_lost_ = false;
     bool worker_fatal_error_ = false;
     uint32_t worker_generation_ = 0;
+    uint32_t worker_event_sequence_ = 0;
 
     std::atomic<uint32_t> connection_attempts_{0};
     std::atomic<uint32_t> reconnect_attempts_{0};
@@ -445,7 +529,7 @@ private:
 
     bool ensureStarted() {
         if (task_active_.load(std::memory_order_acquire)) {
-            return true;
+            return !stop_requested_.load(std::memory_order_acquire);
         }
         if (!validConfig()) {
             return false;
@@ -522,6 +606,7 @@ private:
         if (task_active_.load(std::memory_order_acquire)) {
             return;
         }
+        discardPendingEvents();
         discardQueuedEvents();
         discardQueuedTransmits();
         if (control_event_queue_ != nullptr) {
@@ -688,6 +773,8 @@ private:
 
                 worker_connected_ = true;
                 worker_accept_receive_ = true;
+                connected_generation_.store(desired_generation,
+                                            std::memory_order_release);
                 connected_.store(true, std::memory_order_release);
                 reconnect_delay_ms = config_.reconnect_initial_delay_ms;
                 if (!enqueueControlEvent(EventType::Open,
@@ -738,18 +825,23 @@ private:
                 continue;
             }
 
-            ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(config_.poll_interval_ms));
+            ulTaskNotifyTake(pdTRUE, timeoutTicks(config_.poll_interval_ms));
         }
 
         closeWorkerConnection();
         transport_.setCallbacks({});
         worker_request_ = {};
-        task_active_.store(false, std::memory_order_release);
+#if defined(CONFIG_FREERTOS_TASK_CREATE_ALLOW_EXT_MEM) && \
+    CONFIG_FREERTOS_TASK_CREATE_ALLOW_EXT_MEM
+        const bool stack_in_psram = config_.task_stack_in_psram;
+#endif
         worker_task_.store(nullptr, std::memory_order_release);
+        // This must be the final access to Impl: end() may release the pools,
+        // semaphore and even the owner immediately after receiving this signal.
         xSemaphoreGive(stopped_signal_);
 #if defined(CONFIG_FREERTOS_TASK_CREATE_ALLOW_EXT_MEM) && \
     CONFIG_FREERTOS_TASK_CREATE_ALLOW_EXT_MEM
-        if (config_.task_stack_in_psram) {
+        if (stack_in_psram) {
             vTaskDeleteWithCaps(nullptr);
         } else
 #endif
@@ -784,7 +876,13 @@ private:
         if (stop_requested_.load() || !desired_connected_.load()) {
             return;
         }
-        ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(delay_ms));
+        ulTaskNotifyTake(pdTRUE, timeoutTicks(delay_ms));
+    }
+
+    bool workerSessionCurrent() const {
+        return worker_connected_ && !stop_requested_.load() &&
+               desired_connected_.load() &&
+               worker_generation_ == active_generation_.load();
     }
 
     void serviceTransmits(bool& failed) {
@@ -795,7 +893,7 @@ private:
             if (xQueueReceive(control_tx_queue_, &message, 0) != pdTRUE) {
                 break;
             }
-            if (message.generation == worker_generation_ && worker_connected_) {
+            if (message.generation == worker_generation_ && workerSessionCurrent()) {
                 PayloadSlot& slot = transmit_control_pool_.at(message.payload_slot);
                 const int64_t started_us = esp_timer_get_time();
                 const bool sent =
@@ -815,7 +913,7 @@ private:
 
         TransmitMessage audio;
         if (xQueueReceive(audio_tx_queue_, &audio, 0) == pdTRUE) {
-            if (audio.generation == worker_generation_ && worker_connected_) {
+            if (audio.generation == worker_generation_ && workerSessionCurrent()) {
                 PayloadSlot& slot = transmit_audio_pool_.at(audio.payload_slot);
                 const int64_t started_us = esp_timer_get_time();
                 const bool sent =
@@ -832,6 +930,10 @@ private:
     }
 
     bool enqueueTransmit(const uint8_t* data, size_t size, bool binary) {
+        // Capture ownership before copying. A disconnect during the copy must
+        // never stamp this old audio/control payload with the next generation.
+        const uint32_t generation =
+            active_generation_.load(std::memory_order_acquire);
         const bool invalid = data == nullptr || size == 0 ||
                              !task_active_.load() || !connected();
         const size_t maximum =
@@ -866,9 +968,11 @@ private:
         }
         slot->bytes.assign(data, data + size);
         TransmitMessage message;
-        message.generation = active_generation_.load(std::memory_order_acquire);
+        message.generation = generation;
         message.payload_slot = slot_index;
-        if (xQueueSend(queue, &message, 0) != pdTRUE) {
+        if (!connected() ||
+            generation != active_generation_.load(std::memory_order_acquire) ||
+            xQueueSend(queue, &message, 0) != pdTRUE) {
             pool.release(slot_index);
             if (binary) {
                 ++transmit_audio_rejected_;
@@ -902,6 +1006,7 @@ private:
         EventMessage event;
         event.type = type;
         event.generation = generation;
+        event.sequence = worker_event_sequence_++;
         event.payload_slot = slot_index;
         if (xQueueSend(queue, &event, 0) != pdTRUE) {
             pool.release(slot_index);
@@ -916,6 +1021,7 @@ private:
         EventMessage event;
         event.type = type;
         event.generation = generation;
+        event.sequence = worker_event_sequence_++;
         if (xQueueSend(control_event_queue_, &event, 0) == pdTRUE) {
             notifyClient();
             return true;
@@ -957,6 +1063,7 @@ private:
         EventMessage event;
         event.type = EventType::Error;
         event.generation = generation;
+        event.sequence = worker_event_sequence_++;
         event.payload_slot = slot_index;
         if (xQueueSend(control_event_queue_, &event, 0) != pdTRUE) {
             EventMessage displaced;
@@ -1040,6 +1147,17 @@ private:
             case EventType::Open:
             case EventType::Reconnecting:
                 break;
+        }
+    }
+
+    void discardPendingEvents() {
+        if (has_pending_control_) {
+            releaseEvent(pending_control_);
+            has_pending_control_ = false;
+        }
+        if (has_pending_audio_) {
+            releaseEvent(pending_audio_);
+            has_pending_audio_ = false;
         }
     }
 

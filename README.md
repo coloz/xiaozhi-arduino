@@ -25,7 +25,7 @@
 | ESP32 MAC、持久 UUID、固件版本 | 字体、表情、OGG 和 assets 分区 |
 | 可注入 `Transport` / `EncodedAudioPort` | MQTT+UDP 传输扩展 |
 
-Arduino 会递归编译库 `src/` 中的 `.cpp`，因此可选音频实现以按需包含的头文件保存在 `src/xiaozhi/audio`。普通应用不定义 `XIAOZHI_AUDIO_BOARD` 时不会引入 Opus、Codec 或 ESP-SR 依赖；定义后由 `Xiaozhi.h` 在 sketch 翻译单元中引入所选音频实现。
+Arduino 会递归编译库 `src/` 中的 `.cpp`，因此可选音频实现以按需包含的头文件保存在 `src/xiaozhi/audio`。应用可定义 `XIAOZHI_BOARD`，由 `Xiaozhi.h` 引入所选音频实现；也可显式包含 `Es8311Audio.h` 等音频入口，在 `.ino` 中填写配置对象。两种方式都不使用时，不会引入 Opus、Codec 或 ESP-SR 依赖。
 
 ## 安装
 
@@ -49,7 +49,7 @@ Arduino 会递归编译库 `src/` 中的 `.cpp`，因此可选音频实现以按
 - `examples/TftEmotionFace`：TftRobotEyes 1.1+ 与 TFT_eSPI 2.5+；把服务端的精确表情字符串直接显示为全彩动画眼睛，并输出带稳定枚举值的串口状态。
 - `examples/LvglDisplay`：LVGL 9.x + TFT_eSPI 2.5+；LVGL 负责控件，TFT_eSPI 只负责刷屏。示例自带最小 `lv_conf.h`，干净安装无需修改 LVGL 库目录。该配置只启用示例实际使用的 Label 控件并关闭主题、复杂绘制、Flex/Grid；如需其他控件或圆角/阴影，请按需开启，并留意默认应用分区余量。
 
-五个显示示例都演示 UI 集成，但用途并不完全相同：`U8g2Display`、`U8g2RobotEyesEmotion` 和 `LvglDisplay` 是无音频的显示集成；`TftEsPiDisplay` 与 `TftEmotionFace` 是包含麦克风采集、Opus 编解码和扬声器播放的完整语音终端。显示头文件仍只留在示例侧；可选音频实现位于库的 `src/xiaozhi/audio`，仅在选择音频板时引入。示例默认字体只保证 ASCII；显示中文 STT/TTS 时，应在对应显示库中选择覆盖中文字形的字体。
+五个显示示例都演示 UI 集成，但用途并不完全相同：`U8g2Display`、`U8g2RobotEyesEmotion` 和 `LvglDisplay` 是无音频的显示集成；`TftEsPiDisplay` 与 `TftEmotionFace` 是包含麦克风采集、Opus 编解码和扬声器播放的完整语音终端。显示头文件仍只留在示例侧；可选音频实现位于库的 `src/xiaozhi/audio`，在选择音频板或显式包含音频入口时引入。示例默认字体只保证 ASCII；显示中文 STT/TTS 时，应在对应显示库中选择覆盖中文字形的字体。
 
 两个完整语音示例通过编译期音频 Profile 选择硬件路径，只编译所选后端：
 
@@ -68,30 +68,82 @@ Profile 选择、所需引脚和适用限制见 [AUDIO_PROFILES.md](AUDIO_PROFIL
 即可，无需创建 `BoardConfig.h` 或逐项复制音频引脚：
 
 ```cpp
-#define XIAOZHI_AUDIO_BOARD XIAOZHI_AUDIO_BOARD_NULLLAB_AI_VOX
+#define XIAOZHI_BOARD NULLLAB_AI_VOX
 #include <Xiaozhi.h>
 ```
 
 也可以通过构建参数选择，例如
-`-DXIAOZHI_AUDIO_BOARD=XIAOZHI_AUDIO_BOARD_NULLLAB_AI_VOX`。当前内置：
+`-DXIAOZHI_BOARD=NULLLAB_AI_VOX`。当前内置：
 
 | 选择值 | 开发板 | 音频硬件 |
 | --- | --- | --- |
-| `XIAOZHI_AUDIO_BOARD_OJ_ESP32S3_BASIC` | OpenJumper ESP32 AIOT Basic（`oj_esp32s3basic`） | ES8311，共享全双工 I2S |
-| `XIAOZHI_AUDIO_BOARD_NULLLAB_AI_VOX` | NULLLAB AI VOX 一代 | SPH0645 麦克风 + 独立 I2S 功放 |
+| `OJ_ESP32S3_BASIC` | OpenJumper ESP32 AIOT Basic（`oj_esp32s3basic`） | ES8311，共享全双工 I2S |
+| `NULLLAB_AI_VOX` | NULLLAB AI VOX 一代 | SPH0645 麦克风 + 独立 I2S 功放 |
+| `NULLLAB_AI_VOX3` | NULLLAB AI-VOX3 | ES8311，共享全双工 I2S |
 
-完整示例默认显式选择 `XIAOZHI_AUDIO_BOARD_OJ_ESP32S3_BASIC`。
-AI VOX 预设对应 `ai_vox` 仓库的 `examples/ai_vox_board`，不是引脚不同的
-AI-VOX3。
+两个 TFT 完整语音示例默认显式选择 `OJ_ESP32S3_BASIC`。
+AI VOX 一代预设对应 [ai_vox 的 examples/ai_vox_board](https://github.com/nulllaborg/ai_vox/tree/main/examples/ai_vox_board)；
+AI-VOX3 预设对应 [examples/ai-vox3](https://github.com/nulllaborg/ai_vox/tree/main/examples/ai-vox3)。两者引脚不同，请按硬件版本选择。
+
+AI-VOX3 用法（替换完整示例顶部的板型选择即可）：
+
+```cpp
+#define XIAOZHI_BOARD NULLLAB_AI_VOX3
+#include <Xiaozhi.h>
+```
+
+AI-VOX3 音频 I2C 为 SDA=13、SCL=12，ES8311 的 Wire 地址为 `0x18`（上游的 `0x30` 是 8 位地址）；
+I2S0 为 MCLK=11、BCLK=10、WS=8、DOUT=7、DIN=9，输入和输出均为 16 kHz、16 位双声道 slot，采集左声道。
+麦克风默认增益为 30 dB；sketch 若显式定义 `BOARD_AUDIO_MIC_GAIN_DB`，以 sketch 的设置为准。
+本地唤醒默认开启，仍需安装音频依赖并配置 ESP-SR 模型分区；只用按键对话时可在包含头文件前定义 `XIAOZHI_AUDIO_ENABLE_WAKE_ESP_SR 0`。
+Arduino IDE 选择 ESP32S3 Dev Module、OPI PSRAM、16 MB Flash；启用唤醒时选择 `ESP SR 16M` 分区并烧录模型。
 
 音频预设不会定义任何屏幕、背光或按钮引脚。TFT_eSPI 不支持构造函数传入
 引脚，因此由用户配置已安装库的 `User_Setup.h` 或构建参数，示例目录不再
 附带显示配置头文件；U8g2 的时钟和数据引脚直接保留在单个 `.ino` 的构造器
 附近。切换音频板不会改变显示配置。
 
-自定义音频板使用 `XIAOZHI_AUDIO_BOARD_CUSTOM`，并在包含
+自定义音频板使用 `CUSTOM_BOARD`，并在包含
 `xiaozhi/boards/BoardPresets.h` 前定义所需的 `BOARD_AUDIO_*` 与
 `XIAOZHI_AUDIO_PROFILE` 宏。
+
+## 在 ino 中直接配置音频
+
+也可以直接填写 C++ 配置对象，不需要板型、Profile 或引脚宏。包含一种音频入口后，使用 `Config::forCompiledProfile()` 获取该后端的格式默认值，再填写硬件参数。以下为 AI-VOX3 的音频配置：
+
+```cpp
+#include <EspressifOpus.h>
+#include <Wire.h>
+#include <EspressifEs8311.h>
+#include <xiaozhi/audio/Es8311Audio.h>
+#include <Xiaozhi.h>
+
+I2sOpusAudioPort::Config makeAudioConfig() {
+  auto config = I2sOpusAudioPort::Config::forCompiledProfile();
+  auto& output = config.hardware.output;
+  output.sampleRate = 16000;
+  output.mclk = 11; output.bclk = 10; output.ws = 8; output.data = 7;
+  config.hardware.input = output;
+  config.hardware.input.data = 9;
+  auto& codec = config.hardware.es8311;
+  codec.wire = &Wire;
+  codec.i2cSda = 13; codec.i2cScl = 12; codec.address = 0x18;
+  codec.noDacReference = false;
+  codec.microphoneGainDb = 30.0f;
+  config.captureChannel = I2sOpusAudioPort::CaptureChannel::Left;
+  return config;
+}
+
+I2sOpusAudioPort audioPort(makeAudioConfig());
+// 在 setup() 中、runtime.begin(...) 之前：
+// client.attachAudioPort(&audioPort);
+```
+
+完整用法见 [ManualAudioConfig.ino](examples/ManualAudioConfig/ManualAudioConfig.ino)：Wi-Fi 和音频参数都在 `.ino` 中配置，使用官方配置服务，通过 BOOT/串口开始和打断对话，无需显示库。AI-VOX3 选择 ESP32S3 Dev Module、OPI PSRAM、16 MB Flash 和 `Huge APP` 分区，以容纳音频固件；默认不需要 ESP-SR 模型分区。
+
+直接配置时不要定义 `XIAOZHI_BOARD`；一个 sketch 只选择一个音频入口，并只在一个翻译单元、其他音频头文件之前包含它。`Es8311Audio.h` 的默认格式为 16 位双声道；其他入口包括 `I2sDuplexAudio.h`、`I2sSimplexAudio.h`、`PdmAudio.h` 和 `CustomCodecAudio.h`，具体字段见 [AUDIO_PROFILES.md](AUDIO_PROFILES.md)。配置在构造 `audioPort` 时复制，后续修改原对象不会更新端口，也不能通过运行时字段启用未编译的后端。
+
+这些直接配置入口默认关闭本地唤醒；需要唤醒时，在入口前定义 `XIAOZHI_AUDIO_ENABLE_WAKE_ESP_SR 1` 并包含 `<ESP_SR.h>`，配置和烧录模型分区，再按需设置 `config.enableWakeDetection`。所有音频入口需要 Opus；ES8311 入口另需 ES8311 库和 Wire。
 
 ## 表情事件
 
@@ -236,4 +288,4 @@ config.enable_voice_barge_in = true;
 
 ## 当前兼容范围
 
-核心目标为 ESP32、ESP32-S3、ESP32-C3、ESP32-C5、ESP32-C6 和 ESP32-P4。WebSocket 会话、协议、MCP、配置解析和已编码 Opus 帧接口属于本库；具体音频硬件、Opus 实现、离线唤醒、UI 和 MQTT+UDP 是独立扩展边界。详见 [PERFORMANCE.md](PERFORMANCE.md)、[MIGRATION.md](MIGRATION.md) 和 [TESTING.md](TESTING.md)。
+核心目标为 ESP32、ESP32-S3、ESP32-C3、ESP32-C5、ESP32-C6 和 ESP32-P4。WebSocket 会话、协议、MCP、配置解析和已编码 Opus 帧接口属于本库；具体音频硬件、Opus 实现、离线唤醒、UI 和 MQTT+UDP 是独立扩展边界。详见 [MIGRATION.md](MIGRATION.md)。

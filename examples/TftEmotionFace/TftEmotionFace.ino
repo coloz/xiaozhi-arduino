@@ -20,9 +20,10 @@
  * wn9_nihaoxiaozhi_tts, otherwise the phrase "你好小智" cannot be detected.
  */
 
-// Change this one line to XIAOZHI_AUDIO_BOARD_NULLLAB_AI_VOX for AI VOX audio.
-#ifndef XIAOZHI_AUDIO_BOARD
-#define XIAOZHI_AUDIO_BOARD XIAOZHI_AUDIO_BOARD_OJ_ESP32S3_BASIC
+// Change this one line to NULLLAB_AI_VOX for first-generation AI VOX audio.
+// For the ES8311-based AI-VOX3, use NULLLAB_AI_VOX3.
+#ifndef XIAOZHI_BOARD
+#define XIAOZHI_BOARD OJ_ESP32S3_BASIC
 #endif
 
 #include <Arduino.h>

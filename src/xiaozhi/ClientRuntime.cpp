@@ -177,6 +177,7 @@ public:
         const bool succeeded = startup_succeeded_.load();
         if (!succeeded) {
             xSemaphoreTake(stopped_signal_, portMAX_DELAY);
+            task_active_.store(false);
             releaseResources();
         }
         return succeeded;
@@ -198,6 +199,7 @@ public:
             xSemaphoreTake(stopped_signal_, timeoutTicks(timeout_ms)) != pdTRUE) {
             return false;
         }
+        task_active_.store(false);
         releaseResources();
         return true;
     }
@@ -987,6 +989,14 @@ private:
     }
 
     uint32_t nextServiceDelayMs() const {
+        // Notifications are coalesced (ulTaskNotifyTake clears their count).
+        // A bounded command batch can leave work after the last notification
+        // has been consumed; never sleep until a network/audio deadline then.
+        if (uxQueueMessagesWaiting(command_queue_) != 0 ||
+            uxQueueMessagesWaiting(wake_event_queue_) != 0 ||
+            pending_urgent_controls_.load(std::memory_order_acquire) != 0) {
+            return 0;
+        }
         uint32_t delay_ms = client_.nextProtocolDeadlineMs();
         delay_ms = std::min(delay_ms, nextPlaybackDeadlineMs());
         if (client_.pollingRequired()) {
@@ -1065,8 +1075,10 @@ private:
 
         snapshotClient();
         running_.store(false);
-        task_active_.store(false);
         service_task_handle_.store(nullptr, std::memory_order_release);
+        // Keep task_active_ true until end() consumes the completion signal.
+        // Publishing false here lets end() free stopped_signal_ (or this Impl)
+        // before the worker has finished accessing it.
         xSemaphoreGive(stopped_signal_);
         vTaskDelete(nullptr);
     }

@@ -1,0 +1,50 @@
+#pragma once
+
+// NULLLAB AI-VOX3 (ES8311); first-generation AI VOX uses NullLabAiVox.h.
+// Source: https://github.com/nulllaborg/ai_vox/tree/main/examples/ai-vox3
+// Verified against commit 15587297fc94b8ac71eb9e65992a90f81093e4eb.
+// Audio format and codec settings: src/audio_device/audio_device_es8311.cpp.
+
+#define XIAOZHI_AUDIO_PROFILE XIAOZHI_AUDIO_PROFILE_ES8311
+#ifndef XIAOZHI_AUDIO_ENABLE_WAKE_ESP_SR
+#define XIAOZHI_AUDIO_ENABLE_WAKE_ESP_SR 1
+#endif
+
+#define BOARD_AUDIO_I2C_SDA 13
+#define BOARD_AUDIO_I2C_SCL 12
+#define BOARD_AUDIO_I2C_FREQUENCY 400000
+// Wire uses the 7-bit address; upstream esp_codec_dev uses 0x30 (8-bit).
+#define BOARD_AUDIO_CODEC_ADDRESS 0x18
+
+// ES8311 ADC and DAC share I2S0, MCLK/BCLK/WS and the same sample rate.
+#define BOARD_AUDIO_OUTPUT_I2S_PORT 0
+#define BOARD_AUDIO_OUTPUT_SAMPLE_RATE 16000
+#define BOARD_AUDIO_OUTPUT_MCLK 11
+#define BOARD_AUDIO_OUTPUT_BCLK 10
+#define BOARD_AUDIO_OUTPUT_WS 8
+#define BOARD_AUDIO_OUTPUT_DATA 7
+#define BOARD_AUDIO_OUTPUT_DATA_BITS 16
+#define BOARD_AUDIO_OUTPUT_VALID_BITS 16
+#define BOARD_AUDIO_OUTPUT_SLOT_BITS 16
+#define BOARD_AUDIO_OUTPUT_CHANNELS 2
+#define BOARD_AUDIO_OUTPUT_SLOT I2sOpusAudioPort::I2sSlot::Both
+
+#define BOARD_AUDIO_INPUT_I2S_PORT 0
+#define BOARD_AUDIO_INPUT_SAMPLE_RATE 16000
+#define BOARD_AUDIO_INPUT_MCLK 11
+#define BOARD_AUDIO_INPUT_BCLK 10
+#define BOARD_AUDIO_INPUT_WS 8
+#define BOARD_AUDIO_INPUT_DATA 9
+#define BOARD_AUDIO_INPUT_DATA_BITS 16
+#define BOARD_AUDIO_INPUT_VALID_BITS 16
+#define BOARD_AUDIO_INPUT_SLOT_BITS 16
+#define BOARD_AUDIO_INPUT_CHANNELS 2
+#define BOARD_AUDIO_INPUT_SLOT I2sOpusAudioPort::I2sSlot::Both
+#define BOARD_AUDIO_INPUT_RIGHT_SHIFT 0
+#define BOARD_AUDIO_CAPTURE_CHANNEL I2sOpusAudioPort::CaptureChannel::Left
+
+#define BOARD_AUDIO_CODEC_PA_PIN -1
+#define BOARD_AUDIO_CODEC_NO_DAC_REFERENCE false
+#ifndef BOARD_AUDIO_MIC_GAIN_DB
+#define BOARD_AUDIO_MIC_GAIN_DB 30.0f
+#endif

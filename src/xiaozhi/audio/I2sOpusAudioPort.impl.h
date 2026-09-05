@@ -32,6 +32,7 @@
 #include <atomic>
 #include <climits>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <utility>
 #include <vector>
@@ -313,6 +314,11 @@ struct I2sOpusAudioPort::Impl {
   std::vector<std::vector<int16_t>> capturePool;
   i2s_opus_detail::FixedRingQueue<UplinkPacket> uplinkQueue;
   std::vector<std::vector<uint8_t>> uplinkPool;
+  // Owned by the Client task. Retain a sent buffer until a subsequent
+  // non-blocking queue-lock attempt can return it to the worker pool.
+  std::vector<uint8_t> pendingUplinkRecycle;
+  std::atomic<bool> clientQueueRetryRequested{false};
+  bool nextDownlinkNeedsReset = false;
   i2s_opus_detail::FixedRingQueue<DecodePacket> decodeQueue;
   std::vector<std::vector<uint8_t>> decodePool;
   i2s_opus_detail::FixedRingQueue<PlaybackChunk> playbackQueue;
@@ -335,6 +341,8 @@ struct I2sOpusAudioPort::Impl {
   std::atomic<uint32_t> lastPlaybackWriteMs{0};
   std::atomic<bool> playbackSuppressed{false};
   std::atomic<bool> manualPlaybackMuted{false};
+  std::atomic<bool> playbackTimestampResetRequested{false};
+  std::atomic<uint32_t> lastQueuedPlaybackMs{0};
   std::atomic<uint32_t> capturedPackets{0};
   std::atomic<uint32_t> latestCapturePeak{0};
   std::atomic<uint32_t> latestCaptureRms{0};
@@ -356,6 +364,9 @@ struct I2sOpusAudioPort::Impl {
   std::atomic<bool> playbackMuted{true};
   int32_t speakerGainQ15 = 22938;
   uint32_t lastPerformanceLogMs = 0;
+  std::array<char, 768> performanceLogBuffer{};
+  size_t performanceLogSize = 0;
+  size_t performanceLogOffset = 0;
   std::atomic<uint32_t> maximumEncodeUs{0};
   std::atomic<uint32_t> maximumDecodeUs{0};
   std::atomic<uint32_t> maximumWakeDetectUs{0};
@@ -1207,6 +1218,9 @@ struct I2sOpusAudioPort::Impl {
     playbackQueue.reset(config.maximumPlaybackChunks);
     playbackPool.clear();
     clearPlaybackTimestampsLocked();
+    playbackTimestampResetRequested.store(false);
+    lastQueuedPlaybackMs.store(0);
+    nextDownlinkNeedsReset = false;
     capturedPackets.store(0);
     playedPackets.store(0);
     droppedDecodePackets.store(0);
@@ -1226,6 +1240,9 @@ struct I2sOpusAudioPort::Impl {
     latestCaptureRawRms.store(0);
     latestCaptureOpusBytes.store(0);
     lastPerformanceLogMs = millis();
+    performanceLogSize = 0;
+    performanceLogOffset = 0;
+    clientQueueRetryRequested.store(false);
 
     capturePool.reserve(config.maximumEncodePackets + 1);
     uplinkPool.reserve(config.maximumUplinkPackets + 1);
@@ -1284,7 +1301,7 @@ struct I2sOpusAudioPort::Impl {
           xSemaphoreTake(rxMutex, pdMS_TO_TICKS(25)) == pdTRUE) {
         if (wakeDetectionEnabled.load() && generation == wakeGeneration.load()) {
           result = readCaptureSamples(wakeCaptured.data(), wakeCaptured.size(),
-                                      inputSamples, pdMS_TO_TICKS(20));
+                                      inputSamples, 20);
         }
         xSemaphoreGive(rxMutex);
       }
@@ -1446,13 +1463,7 @@ struct I2sOpusAudioPort::Impl {
       if (wakeTask != nullptr) {
         xTaskNotifyGive(wakeTask);
       }
-      if (Serial) {
-        Serial.printf("[wake] listening for: %s\n", config.defaultWakeWord);
-      }
       return;
-    }
-    if (Serial) {
-      Serial.println("[wake] paused");
     }
   }
 
@@ -1615,10 +1626,12 @@ struct I2sOpusAudioPort::Impl {
     playbackQueue.release();
     std::vector<std::vector<int16_t>>().swap(capturePool);
     std::vector<std::vector<uint8_t>>().swap(uplinkPool);
+    std::vector<uint8_t>().swap(pendingUplinkRecycle);
     std::vector<std::vector<uint8_t>>().swap(decodePool);
     std::vector<std::vector<int16_t>>().swap(playbackPool);
     decodeInFlight = false;
     outputInFlight = false;
+    lastQueuedPlaybackMs.store(0);
   }
 
   void stopWorkers() {
@@ -1818,13 +1831,21 @@ struct I2sOpusAudioPort::Impl {
         continue;
       }
 
+      if (clientQueueRetryRequested.exchange(false)) {
+        // A zero-wait owner-task lock miss must not strand the final uplink
+        // packet when no further capture event arrives. Retry from this
+        // worker, after releasing the mutex, instead of busy-waking Client.
+        notifyAudioEvent();
+      }
+
       bool drained = false;
       if (xSemaphoreTake(queueMutex, portMAX_DELAY) == pdTRUE) {
         drained = decodeQueue.empty() && playbackQueue.empty() &&
                   !decodeInFlight && !outputInFlight;
         xSemaphoreGive(queueMutex);
       }
-      if (manualPlaybackMuted.load() && !playbackMuted.load()) {
+      if ((manualPlaybackMuted.load() || playbackSuppressed.load()) &&
+          !playbackMuted.load()) {
         applyCodecMute(true);
       } else if (drained && !playbackMuted.load() &&
                  millis() - lastPlaybackWriteMs.load() >
@@ -2134,6 +2155,9 @@ struct I2sOpusAudioPort::Impl {
           generation == captureGeneration.load()) {
         // Server-side AEC expects the timestamp of a downlink packet that has
         // actually reached I2S, not the microphone's local millis() value.
+        if (playbackTimestampResetRequested.exchange(false)) {
+          clearPlaybackTimestampsLocked();
+        }
         const PlaybackTimestamp playbackTimestamp = popPlaybackTimestampLocked();
         chunk.timestamp = playbackTimestamp.value;
         chunk.timestampGeneration = playbackTimestamp.generation;
@@ -2253,14 +2277,14 @@ struct I2sOpusAudioPort::Impl {
   }
 
   esp_err_t readCaptureSamples(int16_t* destination, size_t sampleCapacity,
-                               size_t& samplesRead, TickType_t timeout) {
+                               size_t& samplesRead, uint32_t timeoutMs) {
     samplesRead = 0;
     const StandardI2sEndpoint& input = config.hardware.input;
     if (config.hardware.inputMode == InputMode::I2sPdm ||
         input.dataBits == 16) {
       size_t bytesRead = 0;
       const esp_err_t result = i2s_channel_read(
-          rx, destination, sampleCapacity * sizeof(int16_t), &bytesRead, timeout);
+          rx, destination, sampleCapacity * sizeof(int16_t), &bytesRead, timeoutMs);
       samplesRead = bytesRead / sizeof(int16_t);
       return result;
     }
@@ -2268,7 +2292,7 @@ struct I2sOpusAudioPort::Impl {
     size_t bytesRead = 0;
     const esp_err_t result = i2s_channel_read(
         rx, readBuffer32.data(), sampleCapacity * sizeof(int32_t), &bytesRead,
-        timeout);
+        timeoutMs);
     const size_t rawSamples = bytesRead / sizeof(int32_t);
     for (size_t index = 0; index < rawSamples; ++index) {
       destination[index] = pcm32To16(readBuffer32[index], input.rightShift);
@@ -2284,7 +2308,7 @@ struct I2sOpusAudioPort::Impl {
     }
     size_t samplesRead = 0;
     const esp_err_t result = readCaptureSamples(
-        readBuffer.data(), readBuffer.size(), samplesRead, pdMS_TO_TICKS(20));
+        readBuffer.data(), readBuffer.size(), samplesRead, 20);
     xSemaphoreGive(rxMutex);
     if (!captureEnabled.load() || generation != captureGeneration.load()) {
       return;
@@ -2503,22 +2527,49 @@ struct I2sOpusAudioPort::Impl {
       totalBytes = chunk.pcm.size() * sizeof(int16_t);
     }
     size_t offset = 0;
+    uint32_t lastProgressMs = millis();
+    // Keep each driver call to at most 10 ms of PCM. The I2S timeout is in
+    // milliseconds (not FreeRTOS ticks) and applies to DMA-buffer waits.
+    // Short requests let the output task observe abort/mute between writes.
+    const size_t bytesPerFrame = outputChannels *
+        (config.hardware.output.dataBits == 32 ? sizeof(int32_t) : sizeof(int16_t));
+    const size_t writeFrames = std::min<size_t>(
+        config.dmaFrames, std::max<uint32_t>(1, outputSampleRate() / 100));
+    const uint32_t writeTimeoutMs =
+        std::min<uint32_t>(10, config.playbackWriteTimeoutMs);
     while (offset < totalBytes) {
-      if (chunk.generation != playbackGeneration.load() || playbackSuppressed.load()) {
+      if (!workersRunning.load() ||
+          chunk.generation != playbackGeneration.load() || playbackSuppressed.load()) {
         applyCodecMute(true);
         return false;
       }
+      const bool muted = manualPlaybackMuted.load();
+      if (muted != playbackMuted.load() && !applyCodecMute(muted)) {
+        ++outputErrors;
+        return false;
+      }
       size_t written = 0;
+      const size_t requested = std::min(totalBytes - offset, writeFrames * bytesPerFrame);
       const esp_err_t writeResult =
-          i2s_channel_write(tx, pcm + offset, totalBytes - offset, &written,
-                            pdMS_TO_TICKS(config.playbackWriteTimeoutMs));
-      if (writeResult != ESP_OK || written == 0) {
+          i2s_channel_write(tx, pcm + offset, requested, &written, writeTimeoutMs);
+      // Timeout may accompany a partial write. Keep its progress and retry the
+      // remainder instead of dropping the rest of an otherwise valid frame.
+      if ((writeResult != ESP_OK && writeResult != ESP_ERR_TIMEOUT) ||
+          written > requested ||
+          (written == 0 && millis() - lastProgressMs >= config.playbackWriteTimeoutMs)) {
         ++outputErrors;
         applyCodecMute(true);
         return false;
       }
       offset += written;
-      lastPlaybackWriteMs.store(millis());
+      if (written != 0) {
+        lastProgressMs = millis();
+        lastPlaybackWriteMs.store(lastProgressMs);
+      } else {
+        // A driver returning zero bytes immediately must not spin at the
+        // output task's elevated priority while the overall timeout runs.
+        vTaskDelay(1);
+      }
     }
     ++playedPackets;
     return true;
@@ -2527,13 +2578,21 @@ struct I2sOpusAudioPort::Impl {
   void enqueueDecode(const xiaozhi::AudioFrameView& frame) {
     if (!workersRunning.load() || queueMutex == nullptr || frame.opus == nullptr ||
         frame.opus_size == 0 ||
-        frame.opus_size > config.maximumDownlinkOpusBytes) {
+        frame.opus_size > config.maximumDownlinkOpusBytes ||
+        frame.format.frame_duration_ms > config.maximumDecodeQueueMs) {
       ++droppedDecodePackets;
-      decoderResetRequested.store(true);
+      nextDownlinkNeedsReset = true;
       return;
     }
     bool queued = false;
-    if (xSemaphoreTake(queueMutex, portMAX_DELAY) == pdTRUE) {
+    if (xSemaphoreTake(queueMutex, 0) == pdTRUE) {
+      // A cancellation can invalidate queues while another worker holds this
+      // mutex. Reclaim those packets before budgeting a new generation.
+      while (!decodeQueue.empty() &&
+             decodeQueue.front().generation != playbackGeneration.load()) {
+        decodePool.push_back(std::move(decodeQueue.front().frame.opus));
+        decodeQueue.pop_front();
+      }
       uint32_t queuedMs = 0;
       for (const auto& packet : decodeQueue) {
         queuedMs += packet.frame.format.frame_duration_ms;
@@ -2572,7 +2631,10 @@ struct I2sOpusAudioPort::Impl {
           decodePool.push_back(std::move(buffer));
         }
         ++droppedDecodePackets;
-        decoderResetRequested.store(true);
+        nextDownlinkNeedsReset = true;
+        if (droppedForLatency && !decodeQueue.empty()) {
+          decodeQueue.front().resetDecoder = true;
+        }
         xSemaphoreGive(queueMutex);
         return;
       }
@@ -2585,6 +2647,7 @@ struct I2sOpusAudioPort::Impl {
       // assign() therefore performs only the single transport-to-port copy.
       packet.frame.opus.assign(frame.opus, frame.opus + frame.opus_size);
       packet.generation = playbackGeneration.load();
+      packet.resetDecoder = nextDownlinkNeedsReset;
       // Opus prediction cannot safely bridge a deliberately dropped packet.
       // Mark the first retained packet after the gap so the codec task resets
       // immediately before decoding that exact packet, without a timing race
@@ -2600,9 +2663,14 @@ struct I2sOpusAudioPort::Impl {
       if (!queued) {
         decodePool.push_back(std::move(packet.frame.opus));
         ++droppedDecodePackets;
-        decoderResetRequested.store(true);
+        nextDownlinkNeedsReset = true;
+      } else {
+        nextDownlinkNeedsReset = false;
       }
       xSemaphoreGive(queueMutex);
+    } else {
+      ++droppedDecodePackets;
+      nextDownlinkNeedsReset = true;
     }
     if (queued) {
       if (decoderTask != nullptr) {
@@ -2615,11 +2683,12 @@ struct I2sOpusAudioPort::Impl {
     playbackSuppressed.store(true);
     playbackGeneration.fetch_add(1);
     decoderResetRequested.store(true);
-    // Mute before waiting for queue/decoder synchronization so the audible
-    // abort latency is independent of a codec task already in flight.
-    applyCodecMute(true);
+    nextDownlinkNeedsReset = true;
+    lastQueuedPlaybackMs.store(0);
+    // Codec callbacks and I2C belong to the output task. Generation changes
+    // take effect immediately; its bounded I2S writes observe this request.
     if (queueMutex != nullptr &&
-        xSemaphoreTake(queueMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        xSemaphoreTake(queueMutex, 0) == pdTRUE) {
       while (!decodeQueue.empty()) {
         decodePool.push_back(std::move(decodeQueue.front().frame.opus));
         decodeQueue.pop_front();
@@ -2641,10 +2710,8 @@ struct I2sOpusAudioPort::Impl {
 
   bool setManualPlaybackMuted(bool muted) {
     manualPlaybackMuted.store(muted);
-    // Applying both directions here gives a button/ISR request a deterministic
-    // effect. The output task will re-mute an idle speaker after its normal
-    // delay and will not auto-unmute while manual mute remains asserted.
-    applyCodecMute(muted);
+    // Called by the Client owner task, never an ISR. Publishing intent avoids
+    // making that task wait for a shared I2C bus or a custom codec callback.
     if (outputTask != nullptr) {
       xTaskNotifyGive(outputTask);
     }
@@ -2655,7 +2722,7 @@ struct I2sOpusAudioPort::Impl {
 
   void clearCaptureQueues() {
     if (queueMutex == nullptr ||
-        xSemaphoreTake(queueMutex, pdMS_TO_TICKS(100)) != pdTRUE) {
+        xSemaphoreTake(queueMutex, 0) != pdTRUE) {
       return;
     }
     while (!encodeQueue.empty()) {
@@ -2670,14 +2737,29 @@ struct I2sOpusAudioPort::Impl {
   }
 
   void drainUplink() {
-    for (size_t count = 0; count < config.uplinkPacketsPerLoop; ++count) {
+    // One extra lock attempt recycles the final packet without sending beyond
+    // the configured budget. On contention, keep ownership until next loop().
+    for (size_t count = 0; count <= config.uplinkPacketsPerLoop; ++count) {
       UplinkPacket packet;
-      if (xSemaphoreTake(queueMutex, portMAX_DELAY) == pdTRUE) {
-        if (!uplinkQueue.empty()) {
+      if (xSemaphoreTake(queueMutex, 0) == pdTRUE) {
+        if (pendingUplinkRecycle.capacity() != 0) {
+          uplinkPool.push_back(std::move(pendingUplinkRecycle));
+        }
+        if (count < config.uplinkPacketsPerLoop && !uplinkQueue.empty()) {
           packet = std::move(uplinkQueue.front());
           uplinkQueue.pop_front();
         }
+        if (count == config.uplinkPacketsPerLoop && !uplinkQueue.empty()) {
+          // Task notifications coalesce: a burst larger than this cycle's
+          // budget needs another event even if capture has already stopped.
+          clientQueueRetryRequested.store(true);
+        }
         xSemaphoreGive(queueMutex);
+      } else {
+        clientQueueRetryRequested.store(true);
+      }
+      if (clientQueueRetryRequested.load() && outputTask != nullptr) {
+        xTaskNotifyGive(outputTask);
       }
       if (packet.opus.empty()) {
         break;
@@ -2697,10 +2779,7 @@ struct I2sOpusAudioPort::Impl {
           ++rejectedUplinkPackets;
         }
       }
-      if (xSemaphoreTake(queueMutex, portMAX_DELAY) == pdTRUE) {
-        uplinkPool.push_back(std::move(packet.opus));
-        xSemaphoreGive(queueMutex);
-      }
+      pendingUplinkRecycle = std::move(packet.opus);
     }
   }
 
@@ -2709,19 +2788,50 @@ struct I2sOpusAudioPort::Impl {
       return 0;
     }
     uint32_t duration = 0;
-    if (xSemaphoreTake(queueMutex, portMAX_DELAY) == pdTRUE) {
+    if (xSemaphoreTake(queueMutex, 0) == pdTRUE) {
       for (const auto& packet : decodeQueue) {
-        duration += packet.frame.format.frame_duration_ms;
+        if (packet.generation == playbackGeneration.load()) {
+          duration += packet.frame.format.frame_duration_ms;
+        }
       }
       for (const auto& chunk : playbackQueue) {
-        duration += chunk.durationMs;
+        if (chunk.generation == playbackGeneration.load()) {
+          duration += chunk.durationMs;
+        }
       }
+      lastQueuedPlaybackMs.store(duration);
       xSemaphoreGive(queueMutex);
+    } else {
+      return lastQueuedPlaybackMs.load();
     }
     return duration;
   }
 
+  void flushPerformanceLog() {
+    if (!Serial) {
+      performanceLogSize = 0;
+      performanceLogOffset = 0;
+      return;
+    }
+    const int available = Serial.availableForWrite();
+    if (available <= 0 || performanceLogOffset >= performanceLogSize) {
+      return;
+    }
+    const size_t count = std::min<size_t>(
+        std::min<size_t>(static_cast<size_t>(available), 128),
+        performanceLogSize - performanceLogOffset);
+    performanceLogOffset += Serial.write(
+        reinterpret_cast<const uint8_t*>(performanceLogBuffer.data()) +
+            performanceLogOffset,
+        count);
+  }
+
   void logPerformance() {
+    // Do not use printf on the protocol task: even an attached USB monitor can
+    // stop consuming data. Flush only the currently advertised TX capacity.
+    // Applications sharing Serial from other tasks must serialize those writes
+    // themselves; a concurrent writer can consume this capacity first.
+    flushPerformanceLog();
     const uint32_t now = millis();
     if (now - lastPerformanceLogMs < config.performanceLogIntervalMs) {
       return;
@@ -2736,14 +2846,16 @@ struct I2sOpusAudioPort::Impl {
     size_t uplinkDepth = 0;
     size_t decodeDepth = 0;
     size_t playbackDepth = 0;
-    if (xSemaphoreTake(queueMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
+    if (xSemaphoreTake(queueMutex, 0) == pdTRUE) {
       encodeDepth = encodeQueue.size();
       uplinkDepth = uplinkQueue.size();
       decodeDepth = decodeQueue.size();
       playbackDepth = playbackQueue.size();
       xSemaphoreGive(queueMutex);
     }
-    Serial.printf("[audio-perf] q enc=%u up=%u dec=%u play=%u "
+    const int length = snprintf(
+                  performanceLogBuffer.data(), performanceLogBuffer.size(),
+                  "[audio-perf] q enc=%u up=%u dec=%u play=%u "
                   "drop enc=%lu up=%lu dec=%lu stale=%lu reject=%lu "
                   "err in=%lu enc=%lu dec=%lu out=%lu played=%lu "
                   "max_us enc=%lu dec=%lu wake=%lu heap=%lu min=%lu maxblk=%lu "
@@ -2779,6 +2891,11 @@ struct I2sOpusAudioPort::Impl {
                   outputTask == nullptr ? 0 : uxTaskGetStackHighWaterMark(outputTask),
                   wakeTask == nullptr ? 0 : uxTaskGetStackHighWaterMark(wakeTask),
                   uxTaskGetStackHighWaterMark(nullptr));
+    performanceLogSize = length > 0
+        ? std::min<size_t>(static_cast<size_t>(length), performanceLogBuffer.size() - 1)
+        : 0;
+    performanceLogOffset = 0;
+    flushPerformanceLog();
   }
 
   bool isPlaybackIdle() {
@@ -2833,6 +2950,7 @@ bool I2sOpusAudioPort::begin(const xiaozhi::AudioFormat& captureFormat, Uplink u
       config.maximumDownlinkOpusBytes <= 8192 &&
       config.maximumPlaybackChunks > 0 && config.maximumEncodePackets > 0 &&
       config.maximumUplinkPackets > 0 && config.uplinkPacketsPerLoop > 0 &&
+      config.playbackWriteTimeoutMs > 0 &&
       config.inputTaskStackBytes > 0 && config.decoderTaskStackBytes > 0 &&
       config.outputTaskStackBytes > 0 && config.performanceLogIntervalMs > 0 &&
       config.autoChannelSwitchRatio >= 1.0f &&
@@ -2946,11 +3064,7 @@ void I2sOpusAudioPort::setCaptureEnabled(bool enabled) {
     // Capture-owned state is reset by the input task, avoiding a race with a
     // packet that was already being conditioned when the session changed.
     impl_->captureResetRequested.store(true);
-    if (impl_->queueMutex != nullptr &&
-        xSemaphoreTake(impl_->queueMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-      impl_->clearPlaybackTimestampsLocked();
-      xSemaphoreGive(impl_->queueMutex);
-    }
+    impl_->playbackTimestampResetRequested.store(true);
     impl_->captureEnabled.store(true);
   } else {
     // Publish disabled before changing the generation. A capture that already
@@ -2967,9 +3081,6 @@ void I2sOpusAudioPort::setCaptureEnabled(bool enabled) {
     impl_->clearCaptureQueues();
   } else if (impl_->inputTask != nullptr) {
     xTaskNotifyGive(impl_->inputTask);
-  }
-  if (Serial) {
-    Serial.printf("[audio] capture %s\n", enabled ? "enabled" : "disabled");
   }
 }
 

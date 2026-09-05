@@ -7,8 +7,10 @@
 
 // Audio-board support is opt-in. Only microphone, speaker, codec, and audio-bus
 // settings are selected here; display libraries keep their own pin setup.
-//   #define XIAOZHI_AUDIO_BOARD XIAOZHI_AUDIO_BOARD_OJ_ESP32S3_BASIC
-#if defined(XIAOZHI_AUDIO_BOARD)
+//   #define XIAOZHI_BOARD NULLLAB_AI_VOX3
+// For direct .ino configuration, omit XIAOZHI_BOARD and include one audio
+// entry header (e.g. xiaozhi/audio/Es8311Audio.h) after this header instead.
+#if defined(XIAOZHI_BOARD)
 #include "xiaozhi/boards/BoardPresets.h"
 #endif
 
@@ -28,8 +30,8 @@
 #include "xiaozhi/Types.h"
 
 // Keep the optional third-party audio implementation out of normal builds.
-// Defining XIAOZHI_AUDIO_BOARD makes the umbrella header a complete audio-board
+// Defining XIAOZHI_BOARD makes the umbrella header a complete audio-board
 // entry point for the sketch translation unit.
-#if defined(XIAOZHI_AUDIO_BOARD)
+#if defined(XIAOZHI_BOARD)
 #include "xiaozhi/audio/AudioBoard.h"
 #endif

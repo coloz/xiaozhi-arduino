@@ -1,20 +1,59 @@
 # 音频硬件 Profile 配置指南
 
-`TftEsPiDisplay` 使用编译期音频板预设选择麦克风、扬声器和 Codec 配置；预设内部再选择对应的音频 Profile。屏幕、背光和按钮引脚不属于音频预设。新开发板仍可使用 Custom 预设自行填写音频引脚和电气参数。没有选中的 ES8311、PDM 和 WakeNet 代码会被预处理器排除。
+音频支持两种配置方式：通过 `XIAOZHI_BOARD` 选择板型宏预设，或包含专用音频入口、直接在 `.ino` 中填写 `I2sOpusAudioPort::Config`。`TftEsPiDisplay` 演示预设方式，`ManualAudioConfig` 演示配置对象方式。两者都会在编译时选择音频 Profile，没有选中的 ES8311、PDM 和 WakeNet 代码会被预处理器排除。屏幕、背光和按钮引脚由应用单独配置。
 
 本文只描述当前代码已经实现的能力。官方 `xiaozhi-esp32-2.4.0` 中的 ES7210/TDM 麦克风阵列和 ES8388 等方案尚未成为本示例的内置后端，边界见“尚未内置的官方方案”。
 
 ## 快速开始
 
-1. 打开目标 `.ino`，在 `#include <Xiaozhi.h>` 之前定义 `XIAOZHI_AUDIO_BOARD`。
-2. 将它设为库内已有的开发板；OpenJumper ESP32 AIOT Basic 与 NULLLAB AI VOX 一代可直接选择，不需要 `BoardConfig.h`。
-3. 新板选择 `XIAOZHI_AUDIO_BOARD_CUSTOM`，再于包含 `Xiaozhi.h` 前填写下表所需的 `BOARD_AUDIO_*` 和 `XIAOZHI_AUDIO_PROFILE` 宏。
+### 使用开发板宏预设
+
+1. 打开目标 `.ino`，在 `#include <Xiaozhi.h>` 之前定义 `XIAOZHI_BOARD`。
+2. 将它设为库内已有的开发板；OpenJumper ESP32 AIOT Basic、NULLLAB AI VOX 一代与 AI-VOX3 可直接选择，不需要 `BoardConfig.h`。AI-VOX3 使用 `NULLLAB_AI_VOX3`，ES8311 共享 I2S 输入/输出均为 16 kHz；一代使用 `NULLLAB_AI_VOX`，两者引脚不可混用。
+3. 新板选择 `CUSTOM_BOARD`，再于包含 `Xiaozhi.h` 前填写下表所需的 `BOARD_AUDIO_*` 和 `XIAOZHI_AUDIO_PROFILE` 宏。
 4. 根据是否需要本地唤醒设置 `XIAOZHI_AUDIO_ENABLE_WAKE_ESP_SR` 为数值 `0` 或 `1`。
 5. 首次烧录时按文末清单逐项验收；编译成功不等于音频硬件已经工作。
 
-完整示例在 `.ino` 中默认显式选择 `XIAOZHI_AUDIO_BOARD_OJ_ESP32S3_BASIC`。直接使用 `I2sOpusAudioPort.h` 且未定义 `XIAOZHI_AUDIO_PROFILE` 时，为兼容旧代码仍会选择 ES8311。移植新板时建议显式选择 Custom 和音频 Profile，不依赖默认值。
+两个 TFT 完整语音示例在 `.ino` 中默认显式选择 `OJ_ESP32S3_BASIC`。直接使用 `I2sOpusAudioPort.h` 且未定义 `XIAOZHI_AUDIO_PROFILE` 时，为兼容旧代码仍会选择 ES8311。移植新板时可选择 Custom 和音频 Profile，或使用下面的专用音频入口，不依赖旧默认值。
 
-显示配置始终由应用负责：TFT_eSPI 在已安装库的 `User_Setup.h` 或构建参数中填写屏幕引脚，不在示例目录增加配置头文件；U8g2 直接在单个 `.ino` 的构造函数附近传入屏幕引脚。切换 `XIAOZHI_AUDIO_BOARD` 不会影响显示。
+显示配置始终由应用负责：TFT_eSPI 在已安装库的 `User_Setup.h` 或构建参数中填写屏幕引脚，不在示例目录增加配置头文件；U8g2 直接在单个 `.ino` 的构造函数附近传入屏幕引脚。切换 `XIAOZHI_BOARD` 不会影响显示。
+
+### 在 ino 中填写配置对象
+
+直接配置无需定义 `XIAOZHI_BOARD`、`XIAOZHI_AUDIO_PROFILE` 或 `BOARD_AUDIO_*`。在 `.ino` 中选用以下一个头文件；它会选择对应后端并引入实现：
+
+| 头文件（均位于 `xiaozhi/audio/`） | 后端 | 主要硬件配置字段 |
+| --- | --- | --- |
+| `Es8311Audio.h` | ES8311，共享 I2S | `hardware.input`、`hardware.output`、`hardware.es8311` |
+| `I2sDuplexAudio.h` | 共享时钟的 I2S 麦克风和扬声器 | `hardware.input`、`hardware.output`、`hardware.amplifier` |
+| `I2sSimplexAudio.h` | 独立控制器的 I2S 麦克风和扬声器 | `hardware.input`、`hardware.output`、`hardware.amplifier` |
+| `PdmAudio.h` | PDM 麦克风和标准 I2S 扬声器 | `hardware.pdmInput`、`hardware.output`、`hardware.amplifier` |
+| `CustomCodecAudio.h` | 标准 I2S 与用户 Codec 回调 | `hardware.input`、`hardware.output`、`codec` |
+
+一个 sketch 只使用一种入口，并只在一个翻译单元中包含它；入口应放在其他音频头文件之前。这种方式不与板型预设混用。依赖头文件如 `<EspressifOpus.h>`、`<Wire.h>`、`<EspressifEs8311.h>` 可放在入口之前，以便 Arduino 发现依赖库。
+
+配置步骤：
+
+1. 调用 `I2sOpusAudioPort::Config::forCompiledProfile()`，获取与所选入口一致的控制器、采样率及格式默认值。
+2. 填写硬件引脚和板级参数；需要时调整采样率、增益、采集声道等字段。共享 I2S 的输入和输出仍必须满足下文的时钟与格式约束。
+3. 用完成的配置构造 `I2sOpusAudioPort audioPort(config)`。构造函数复制配置，因此修改原来的 `config` 不会更新已经创建的端口。
+4. 在 `runtime.begin(...)` 之前调用 `client.attachAudioPort(&audioPort)`，并保证端口对象的生命周期覆盖 Runtime 的使用期。
+
+常用字段可直接赋值：
+
+| 配置对象字段 | 设置内容 |
+| --- | --- |
+| `hardware.input` / `hardware.output` 的 `port`、`sampleRate`、`mclk`、`bclk`、`ws`、`data` | 标准 I2S 控制器、采样率和引脚 |
+| 标准 I2S 端点的 `dataBits`、`validBits`、`slotBits`、`channels`、`slot`、`rightShift` | DMA 格式、slot 与麦克风有效位对齐 |
+| `hardware.pdmInput` 的 `port`、`sampleRate`、`clock`、`data` | PDM 麦克风端点 |
+| `hardware.es8311` 的 `wire`、`i2cSda`、`i2cScl`、`address`、`microphoneGainDb`、`noDacReference` | ES8311 控制总线、增益与 DAC reference 行为 |
+| `hardware.amplifier` 的 `enablePin`、`activeLevel`、`volumePercent` | 无 Codec 方案的功放使能及软件音量 |
+| `captureChannel` | `I2sOpusAudioPort::CaptureChannel::Left`、`Right` 或 `Auto` |
+| `enableWakeDetection` | 是否运行已编译的唤醒检测 |
+
+AI-VOX3 的完整配置见 [ManualAudioConfig.ino](examples/ManualAudioConfig/ManualAudioConfig.ino)，简短用法见 [README](README.md#在-ino-中直接配置音频)。示例使用 ES8311 的 16 位双声道默认格式，将输入和输出采样率均改为 16 kHz，并填写 AI-VOX3 的 I2S/I2C 引脚、左声道采集和 Codec 参数。Wi-Fi、官方配置服务、BOOT/串口对话也包含在同一个 `.ino`，无需显示库。
+
+这些入口默认不编译本地唤醒。需要时在入口前定义 `XIAOZHI_AUDIO_ENABLE_WAKE_ESP_SR 1` 并包含 `<ESP_SR.h>`，准备模型分区，再设置 `config.enableWakeDetection`；默认值会跟随编译开关。仅把运行时字段改为 `true` 不能启用已经裁剪掉的 WakeNet，改变 `hardware.codecMode` 等字段也不能加载未编译的后端。
 
 ## Profile 与器件别名
 
@@ -52,9 +91,9 @@ Profile 会在 `I2sOpusAudioPort.h` 中派生数值为 `0` 或 `1` 的 `XIAOZHI_
 - `XIAOZHI_AUDIO_ENABLE_AMP_GPIO`
 - `XIAOZHI_AUDIO_ENABLE_WAKE_ESP_SR`
 
-普通板卡只应选择 `XIAOZHI_AUDIO_PROFILE`，不要逐个打开底层宏。高级 Custom 配置可以在包含 `I2sOpusAudioPort.h` 之前覆盖它们，但值必须是数值 `0` 或 `1`；多编译后端会增加固件和依赖，也更容易构造出运行时配置与编译后端不一致的组合。
+普通板卡通过板型预设、专用音频入口或 `XIAOZHI_AUDIO_PROFILE` 选择后端，不要逐个打开底层宏。高级 Custom 配置可以在包含 `I2sOpusAudioPort.h` 之前覆盖它们，但值必须是数值 `0` 或 `1`；多编译后端会增加固件和依赖，也更容易构造出运行时配置与编译后端不一致的组合。
 
-`library.properties` 只声明 Xiaozhi 核心依赖。使用本完整示例时，仍需根据选项安装对应的 Opus、ES8311 或 ESP-SR 组件。
+`library.properties` 只声明 Xiaozhi 核心依赖。无论使用板型预设还是直接配置对象，都需安装 Opus，并按所选后端和唤醒开关安装 ES8311 或 ESP-SR 组件。
 
 ## 音频板预设公共字段
 

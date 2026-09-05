@@ -25,7 +25,7 @@ Rather than copying the entire original ESP-IDF project into Arduino, it retains
 | ESP32 MAC address, persistent UUID, and firmware version | Fonts, emoji, OGG files, and asset partitions |
 | Injectable `Transport` / `EncodedAudioPort` | MQTT+UDP transport extensions |
 
-Arduino recursively compiles `.cpp` files under a library's `src/` directory, so the optional audio implementation is stored as opt-in headers under `src/xiaozhi/audio`. A normal application that does not define `XIAOZHI_AUDIO_BOARD` pulls in no Opus, codec, or ESP-SR dependency. Once selected, `Xiaozhi.h` includes that audio implementation in the sketch translation unit.
+Arduino recursively compiles `.cpp` files under a library's `src/` directory, so the optional audio implementation is stored as opt-in headers under `src/xiaozhi/audio`. Define `XIAOZHI_BOARD` to have `Xiaozhi.h` include the selected implementation, or explicitly include an audio entry point such as `Es8311Audio.h` and fill a configuration object in the `.ino`. Applications using neither path pull in no Opus, codec, or ESP-SR dependency.
 
 ## Installation
 
@@ -50,7 +50,7 @@ Display libraries are not core dependencies. Install them separately as needed a
 - `examples/TftEmotionFace`: TftRobotEyes 1.1+ and TFT_eSPI 2.5+; displays the server's exact emotion strings as full-color animated eyes and prints serial state with stable enum values.
 - `examples/LvglDisplay`: LVGL 9.x + TFT_eSPI 2.5+; LVGL manages widgets, while TFT_eSPI only flushes pixels to the display. The example includes a minimal `lv_conf.h`, so a clean installation does not require changes to the LVGL library directory. This configuration enables only the Label widget used by the example and disables themes, complex drawing, Flex, and Grid. Enable additional features as needed for other widgets, rounded corners, or shadows, and keep an eye on the remaining space in the default application partition.
 
-All five display examples demonstrate UI integration, but they do not have identical scope. `U8g2Display`, `U8g2RobotEyesEmotion`, and `LvglDisplay` are display-only integrations without audio. `TftEsPiDisplay` and `TftEmotionFace` are complete voice terminals with microphone capture, Opus encoding/decoding, and speaker playback. Display headers remain on the example side; the optional audio implementation lives under `src/xiaozhi/audio` and is included only when an audio board is selected. Their default fonts cover ASCII only. To display Chinese STT/TTS text, choose a font with the required Chinese glyphs in the corresponding display library.
+All five display examples demonstrate UI integration, but they do not have identical scope. `U8g2Display`, `U8g2RobotEyesEmotion`, and `LvglDisplay` are display-only integrations without audio. `TftEsPiDisplay` and `TftEmotionFace` are complete voice terminals with microphone capture, Opus encoding/decoding, and speaker playback. Display headers remain on the example side; the optional audio implementation lives under `src/xiaozhi/audio` and is included when an audio board or an explicit audio entry point is selected. Their default fonts cover ASCII only. To display Chinese STT/TTS text, choose a font with the required Chinese glyphs in the corresponding display library.
 
 The two complete voice examples select their hardware path through a compile-time audio profile, so only the chosen backend is compiled:
 
@@ -69,21 +69,35 @@ under `src/xiaozhi/boards`. Select one value at the top of the `.ino`, before
 including `Xiaozhi.h`; no `BoardConfig.h` or copied audio pin list is required:
 
 ```cpp
-#define XIAOZHI_AUDIO_BOARD XIAOZHI_AUDIO_BOARD_NULLLAB_AI_VOX
+#define XIAOZHI_BOARD NULLLAB_AI_VOX
 #include <Xiaozhi.h>
 ```
 
 The same selection can be supplied as a build flag, for example
-`-DXIAOZHI_AUDIO_BOARD=XIAOZHI_AUDIO_BOARD_NULLLAB_AI_VOX`. Built-in presets are:
+`-DXIAOZHI_BOARD=NULLLAB_AI_VOX`. Built-in presets are:
 
 | Selection | Board | Audio hardware |
 | --- | --- | --- |
-| `XIAOZHI_AUDIO_BOARD_OJ_ESP32S3_BASIC` | OpenJumper ESP32 AIOT Basic (`oj_esp32s3basic`) | ES8311 on shared full-duplex I2S |
-| `XIAOZHI_AUDIO_BOARD_NULLLAB_AI_VOX` | first-generation NULLLAB AI VOX | SPH0645 microphone plus an independent I2S amplifier |
+| `OJ_ESP32S3_BASIC` | OpenJumper ESP32 AIOT Basic (`oj_esp32s3basic`) | ES8311 on shared full-duplex I2S |
+| `NULLLAB_AI_VOX` | first-generation NULLLAB AI VOX | SPH0645 microphone plus an independent I2S amplifier |
+| `NULLLAB_AI_VOX3` | NULLLAB AI-VOX3 | ES8311 on shared full-duplex I2S |
 
-The complete examples explicitly default to
-`XIAOZHI_AUDIO_BOARD_OJ_ESP32S3_BASIC`. The AI VOX preset follows the `ai_vox`
-repository's `examples/ai_vox_board`; it is not the pin-incompatible AI-VOX3.
+The two complete TFT voice examples explicitly default to
+`OJ_ESP32S3_BASIC`. The AI VOX preset follows the `ai_vox`
+repository's `examples/ai_vox_board`. The separate AI-VOX3 preset follows
+[examples/ai-vox3](https://github.com/nulllaborg/ai_vox/tree/main/examples/ai-vox3).
+Select `NULLLAB_AI_VOX3` before including `Xiaozhi.h`
+for that hardware revision.
+
+AI-VOX3 uses I2C SDA=13/SCL=12 and Wire address `0x18` (upstream `0x30`
+is an 8-bit address). Shared I2S0 uses MCLK=11, BCLK=10, WS=8, DOUT=7,
+and DIN=9, with 16 kHz, 16-bit stereo slots and left-channel capture.
+Microphone gain defaults to 30 dB unless the sketch defines
+`BOARD_AUDIO_MIC_GAIN_DB`. Local wake detection defaults to enabled and
+requires the audio dependencies and an ESP-SR model partition. Define
+`XIAOZHI_AUDIO_ENABLE_WAKE_ESP_SR 0` before the include for button-only use.
+Select ESP32S3 Dev Module, OPI PSRAM, and 16 MB Flash in Arduino IDE;
+for local wake detection, select the `ESP SR 16M` partition and flash its model.
 
 Audio presets define no display, backlight, or button pins. TFT_eSPI cannot
 accept pins in its constructor, so configure the installed library's
@@ -91,9 +105,47 @@ accept pins in its constructor, so configure the installed library's
 header. U8g2 clock and data pins stay beside the constructor in the single
 `.ino`. Changing an audio preset never changes the display configuration.
 
-For a new audio board, select `XIAOZHI_AUDIO_BOARD_CUSTOM` and define the
+For a new audio board, select `CUSTOM_BOARD` and define the
 required `BOARD_AUDIO_*` and `XIAOZHI_AUDIO_PROFILE` macros before including
 `xiaozhi/boards/BoardPresets.h`.
+
+## Configure Audio Directly in the ino
+
+You can also fill a C++ configuration object without board, profile, or pin macros. Include one audio entry point, use `Config::forCompiledProfile()` for its format defaults, and fill in the hardware settings. For AI-VOX3:
+
+```cpp
+#include <EspressifOpus.h>
+#include <Wire.h>
+#include <EspressifEs8311.h>
+#include <xiaozhi/audio/Es8311Audio.h>
+#include <Xiaozhi.h>
+
+I2sOpusAudioPort::Config makeAudioConfig() {
+  auto config = I2sOpusAudioPort::Config::forCompiledProfile();
+  auto& output = config.hardware.output;
+  output.sampleRate = 16000;
+  output.mclk = 11; output.bclk = 10; output.ws = 8; output.data = 7;
+  config.hardware.input = output;
+  config.hardware.input.data = 9;
+  auto& codec = config.hardware.es8311;
+  codec.wire = &Wire;
+  codec.i2cSda = 13; codec.i2cScl = 12; codec.address = 0x18;
+  codec.noDacReference = false;
+  codec.microphoneGainDb = 30.0f;
+  config.captureChannel = I2sOpusAudioPort::CaptureChannel::Left;
+  return config;
+}
+
+I2sOpusAudioPort audioPort(makeAudioConfig());
+// In setup(), before runtime.begin(...):
+// client.attachAudioPort(&audioPort);
+```
+
+See [ManualAudioConfig.ino](examples/ManualAudioConfig/ManualAudioConfig.ino) for the complete sketch. It keeps Wi-Fi and audio settings in the `.ino`, uses official provisioning, and starts or interrupts conversations through BOOT/serial without a display library. For AI-VOX3, select ESP32S3 Dev Module, OPI PSRAM, 16 MB Flash, and the `Huge APP` partition so the audio firmware fits. No ESP-SR model partition is needed by default.
+
+Do not define `XIAOZHI_BOARD` for this path. Select exactly one audio entry point in exactly one sketch translation unit, before other audio headers. `Es8311Audio.h` defaults to 16-bit stereo. Other entry points are `I2sDuplexAudio.h`, `I2sSimplexAudio.h`, `PdmAudio.h`, and `CustomCodecAudio.h`; see [AUDIO_PROFILES.md](AUDIO_PROFILES.md) for their fields. The constructor copies the configuration, so finish editing it before constructing `audioPort`. Changing the original object afterward does not update the port, and runtime fields cannot enable a backend that was not compiled.
+
+These entry points disable local wake detection by default. To enable it, define `XIAOZHI_AUDIO_ENABLE_WAKE_ESP_SR 1` and include `<ESP_SR.h>` before the audio entry point, configure and flash the model partition, and set `config.enableWakeDetection` as needed. All audio entry points require Opus; the ES8311 entry point also requires the ES8311 library and Wire.
 
 ## Emotion Events
 
@@ -245,4 +297,4 @@ The built-in adapter switches ArduinoWebsockets 0.5.x to fragment notifications 
 
 ## Current Compatibility Scope
 
-The core targets ESP32, ESP32-S3, ESP32-C3, ESP32-C5, ESP32-C6, and ESP32-P4. WebSocket sessions, protocols, MCP, provisioning parsing, and the encoded Opus frame interface belong to this library. Specific audio hardware, Opus implementations, offline wake-word detection, UI, and MQTT+UDP remain separate extension boundaries. See [PERFORMANCE.md](PERFORMANCE.md), [MIGRATION.md](MIGRATION.md), and [TESTING.md](TESTING.md) for details.
+The core targets ESP32, ESP32-S3, ESP32-C3, ESP32-C5, ESP32-C6, and ESP32-P4. WebSocket sessions, protocols, MCP, provisioning parsing, and the encoded Opus frame interface belong to this library. Specific audio hardware, Opus implementations, offline wake-word detection, UI, and MQTT+UDP remain separate extension boundaries. See [MIGRATION.md](MIGRATION.md) for details.

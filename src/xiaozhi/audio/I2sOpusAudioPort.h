@@ -8,7 +8,10 @@
 
 class TwoWire;
 
-// Select exactly one hardware profile before including this header.  Like a
+// Direct .ino setup can include Es8311Audio.h, I2sDuplexAudio.h,
+// I2sSimplexAudio.h, PdmAudio.h, or CustomCodecAudio.h, then fill the Config
+// returned by forCompiledProfile(). These entries also load the implementation.
+// Low-level users select exactly one hardware profile before this header. Like a
 // U8g2 constructor, the selected profile determines which backend code and
 // optional dependencies are compiled into this sketch translation unit.
 #ifndef XIAOZHI_AUDIO_PROFILE
@@ -318,6 +321,8 @@ class I2sOpusAudioPort final : public xiaozhi::EncodedAudioPort {
 
     // Supply all three callbacks to use a different codec. The application
     // owns the callback context and must keep it alive while this port exists.
+    // Runtime mute changes run on the output worker; begin/end still run on
+    // the owner task. Keep callbacks bounded and synchronize any shared bus.
     CodecCallbacks codec;
 
     // Buffering and worker tasks.
@@ -337,6 +342,8 @@ class I2sOpusAudioPort final : public xiaozhi::EncodedAudioPort {
     uint8_t inputTaskPriority = 8;
     uint8_t decoderTaskPriority = 2;
     uint8_t outputTaskPriority = 4;
+    // Maximum interval without DMA write progress. Individual I2S requests
+    // carry at most 10 ms of PCM so the worker can service mute/abort promptly.
     uint32_t playbackWriteTimeoutMs = 250;
     uint32_t playbackMuteDelayMs = 600;
     uint32_t playbackIdleDelayMs = 100;

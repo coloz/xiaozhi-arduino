@@ -81,6 +81,9 @@ private:
     std::string string_value_;
 };
 
+// Runs synchronously on the Client owner task (the service task with Runtime).
+// Keep handlers/authorizers bounded: queue slow device work elsewhere and return
+// an acceptance result instead of waiting for HTTP, motion, or display I/O.
 using McpHandler = std::function<McpResult(const McpArguments& arguments)>;
 using McpUserToolAuthorizer = std::function<bool(const std::string& tool_name)>;
 

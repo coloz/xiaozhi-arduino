@@ -84,7 +84,10 @@ struct ProvisioningRequest {
 };
 
 // HTTP is an adapter: the caller supplies a configured plain or TLS NetworkClient.
-// For HTTPS, configure CA verification on NetworkClientSecure before calling fetch().
+// For HTTPS, configure CA verification and setHandshakeTimeout(seconds) on
+// NetworkClientSecure before calling fetch(). HTTP connect/read limits do not
+// set the TLS handshake timeout. This API is synchronous; keep it off the
+// Runtime/audio tasks. Read timeouts bound inactivity, not the entire response.
 class ArduinoProvisioningClient {
 public:
     static bool fetch(NetworkClient& network, const ProvisioningRequest& request,
@@ -102,6 +105,8 @@ struct OfficialServiceOptions {
     const char* primary_ntp_server = "ntp.aliyun.com";
     const char* secondary_ntp_server = "pool.ntp.org";
     uint32_t time_sync_timeout_ms = 15000;
+    // Per TCP connect, TLS handshake (rounded up to seconds), and HTTP read
+    // inactivity timeout; not a total wall-clock deadline including DNS/NTP.
     uint32_t request_timeout_ms = 15000;
 };
 

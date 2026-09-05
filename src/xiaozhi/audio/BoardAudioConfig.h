@@ -4,8 +4,8 @@
 #include "../boards/BoardPresets.h"
 #include "I2sOpusAudioPort.h"
 
-#ifndef XIAOZHI_AUDIO_BOARD
-#error "Define XIAOZHI_AUDIO_BOARD before including Xiaozhi.h"
+#ifndef XIAOZHI_BOARD
+#error "Define XIAOZHI_BOARD before including Xiaozhi.h"
 #endif
 
 #if XIAOZHI_AUDIO_ENABLE_CODEC_ES8311

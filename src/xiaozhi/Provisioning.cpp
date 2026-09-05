@@ -532,6 +532,9 @@ bool ArduinoOfficialService::configure(ClientConfig& config,
     }
 
     NetworkClientSecure tls;
+    // HTTPClient's connect timeout does not configure the TLS handshake.
+    // NetworkClientSecure expects seconds here (rounded up, minimum one).
+    tls.setHandshakeTimeout((options.request_timeout_ms + 999U) / 1000U);
 #if CONFIG_MBEDTLS_CERTIFICATE_BUNDLE
     tls.setCACertBundle(x509CrtBundleStart,
                         static_cast<size_t>(x509CrtBundleEnd - x509CrtBundleStart));

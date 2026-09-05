@@ -19,6 +19,8 @@ struct AsyncTransportConfig {
     uint8_t task_priority = 1;
     int8_t task_core = 0;
     uint16_t poll_interval_ms = 2;
+    // Checked after the wrapped synchronous connect() returns. This rejects a
+    // late connection; it cannot interrupt a blocked TCP/TLS dependency.
     uint32_t connect_timeout_ms = 10000;
     uint16_t reconnect_initial_delay_ms = 250;
     uint16_t reconnect_max_delay_ms = 5000;
@@ -73,6 +75,8 @@ struct AsyncTransportStats {
 // sees only non-blocking queue operations and receives copied events when it
 // calls loop(). The wrapped transport must not be accessed anywhere else after
 // AsyncTransport has started.
+// Serialize connect/loop/close/end on the owning Client task. Call end() and
+// destroy the wrapper only after that task and its callbacks have quiesced.
 class AsyncTransport final : public Transport {
 public:
     explicit AsyncTransport(Transport& transport,
@@ -101,7 +105,8 @@ public:
     TransportLimitStats limitStats() const override;
 
     // Stops the network task and quiesces the wrapped transport. A finite
-    // timeout that returns false leaves the object active and safe to retry.
+    // timeout that returns false leaves shutdown pending: retry end() before
+    // connecting again. The wrapped dependency must return for shutdown to end.
     bool end(uint32_t timeout_ms = 5000);
     bool running() const;
     AsyncTransportStats stats() const;

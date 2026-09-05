@@ -6,9 +6,10 @@
  * 构造函数传入引脚，烧录前请在 TFT_eSPI 自身配置或构建参数中设置显示硬件。
  */
 
-// Change this one line to XIAOZHI_AUDIO_BOARD_NULLLAB_AI_VOX for AI VOX audio.
-#ifndef XIAOZHI_AUDIO_BOARD
-#define XIAOZHI_AUDIO_BOARD XIAOZHI_AUDIO_BOARD_OJ_ESP32S3_BASIC
+// Change this one line to NULLLAB_AI_VOX for first-generation AI VOX audio.
+// For the ES8311-based AI-VOX3, use NULLLAB_AI_VOX3.
+#ifndef XIAOZHI_BOARD
+#define XIAOZHI_BOARD OJ_ESP32S3_BASIC
 #endif
 
 // This enclosure/microphone measured reliably at 42 dB without clipping.
@@ -44,7 +45,7 @@ SET_LOOP_TASK_STACK_SIZE(16 * 1024);
 
 // Optional dependencies for this example only:
 //   TFT_eSPI >= 2.5 and ArduinoWebsockets >= 0.5.4
-// XIAOZHI_AUDIO_BOARD selects only microphone/speaker wiring. Display and UI
+// XIAOZHI_BOARD selects only microphone/speaker wiring. Display and UI
 // GPIO remain application-owned.
 TFT_eSPI tft;
 xiaozhi::ArduinoWebSocketTransport network_transport;

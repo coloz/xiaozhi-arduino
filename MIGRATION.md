@@ -32,9 +32,11 @@ config.client_id = xiaozhi::Esp32Identity::persistentClientId();
 
 ### 音频配置
 
-`TftEsPiDisplay` 和 `TftEmotionFace` 现在使用编译期音频 Profile，只把选中的麦克风、扬声器和 Codec 后端编译进固件。可选项包括 ES8311、共享时钟 I2S、独立 I2S（如 INMP441/MSM261 + MAX98357A）、PDM + MAX98357A 以及自定义 Codec；选择方法和硬件约束见 [AUDIO_PROFILES.md](AUDIO_PROFILES.md)。实现位于 `src/xiaozhi/audio` 的按需包含头文件中，未定义 `XIAOZHI_AUDIO_BOARD` 时不会引入这些依赖。
+`TftEsPiDisplay` 和 `TftEmotionFace` 现在使用编译期音频 Profile，只把选中的麦克风、扬声器和 Codec 后端编译进固件。可选项包括 ES8311、共享时钟 I2S、独立 I2S（如 INMP441/MSM261 + MAX98357A）、PDM + MAX98357A 以及自定义 Codec；选择方法和硬件约束见 [AUDIO_PROFILES.md](AUDIO_PROFILES.md)。实现位于 `src/xiaozhi/audio` 的按需包含头文件中；不选择 `XIAOZHI_BOARD`、也不显式包含音频入口头文件时，不会引入这些依赖。
 
-已有 sketch 直接填写 `I2sOpusAudioPort::Config` 的平坦字段仍保持源码兼容。新代码应先使用 `I2sOpusAudioPort::Config::forCompiledProfile()` 取得所选 Profile 的安全默认值，再填写对应端点；完整示例则通过 `.ino` 中的 `XIAOZHI_AUDIO_BOARD` 选择库内音频预设，由 `BoardAudioConfig.h` 的 `xiaozhi_audio_board::makeConfig()` 将 `BOARD_AUDIO_*` 宏转换为该配置。这样运行时调优仍可保留，同时未选中的后端在预处理阶段就被裁掉。
+已有 sketch 直接填写 `I2sOpusAudioPort::Config` 的平坦字段仍保持源码兼容。新代码应先使用 `I2sOpusAudioPort::Config::forCompiledProfile()` 取得所选 Profile 的安全默认值，再填写对应端点；完整示例则通过 `.ino` 中的 `XIAOZHI_BOARD` 选择库内音频预设，由 `BoardAudioConfig.h` 的 `xiaozhi_audio_board::makeConfig()` 将 `BOARD_AUDIO_*` 宏转换为该配置。这样运行时调优仍可保留，同时未选中的后端在预处理阶段就被裁掉。
+
+若希望直接在 `.ino` 填写音频参数，可参考 [ManualAudioConfig](examples/ManualAudioConfig/ManualAudioConfig.ino)：包含 `xiaozhi/audio/Es8311Audio.h` 后创建 `Config::forCompiledProfile()`，填写其 `hardware` 字段并传入音频对象构造函数，不需要板型或引脚宏。宏预设入口仍可继续使用。
 
 ## 行为差异
 

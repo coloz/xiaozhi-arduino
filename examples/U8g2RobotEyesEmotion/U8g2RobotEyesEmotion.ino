@@ -151,17 +151,19 @@ void setup() {
   xiaozhi::OfficialServiceOptions serviceOptions;
   serviceOptions.board_name = "ESP32-S3 OLED U8g2RobotEyes";
   Serial.println("[network] fetching official Xiaozhi configuration");
-  if (!xiaozhi::ArduinoOfficialService::configure(
-          config, provisioning, provisioningError, serviceOptions)) {
-    queueLocalEmotion("shocked");
-    Serial.printf("[xiaozhi] provisioning failed: %s\n",
-                  provisioningError.c_str());
-    return;
-  }
+  const bool configured = xiaozhi::ArduinoOfficialService::configure(
+      config, provisioning, provisioningError, serviceOptions);
+  // An unbound device can receive an activation code without WebSocket config.
   if (provisioning.activation.present && !provisioning.activation.code.empty()) {
     Serial.printf("[xiaozhi] activation code=%s message=%s\n",
                   provisioning.activation.code.c_str(),
                   provisioning.activation.message.c_str());
+  }
+  if (!configured) {
+    queueLocalEmotion("shocked");
+    Serial.printf("[xiaozhi] provisioning failed: %s\n",
+                  provisioningError.c_str());
+    return;
   }
   network_transport.setCACertificate(
       xiaozhi::ArduinoOfficialService::rootCACertificate());
