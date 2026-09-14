@@ -8,7 +8,7 @@
  * owns its TFT and BOOT-button configuration.
  *
  * Required libraries:
- *   - TftRobotEyes >= 1.1.0
+ *   - grokEyes
  *   - TFT_eSPI >= 2.5 (configure User_Setup for your display first)
  *   - ArduinoWebsockets >= 0.5.4
  *   - EspressifEs8311 (only for the ES8311 profile)
@@ -29,6 +29,9 @@
 #include <Arduino.h>
 #include <Xiaozhi.h>
 
+#include <esp_heap_caps.h>
+#include <mbedtls/platform.h>
+
 #include <ArduinoWebsockets.h>
 #if XIAOZHI_AUDIO_ENABLE_WAKE_ESP_SR
 #include <ESP_SR.h>
@@ -38,7 +41,7 @@
 #endif
 #include <EspressifOpus.h>
 #include <TFT_eSPI.h>
-#include <TftRobotEyes.h>
+#include <grokEyes.h>
 #include <WiFi.h>
 
 #include <cstring>
@@ -96,12 +99,29 @@ SET_LOOP_TASK_STACK_SIZE(16 * 1024);
 #endif
 
 TFT_eSPI tft;
-TftRobotEyes eyes(tft, TftRobotEyes::PLAIN_BASIC);
+grokEyes eyes(tft, grokEyes::PLAIN_BASIC);
 xiaozhi::ArduinoWebSocketTransport network_transport;
-xiaozhi::AsyncTransport transport(network_transport);
+
+xiaozhi::AsyncTransportConfig makeTransportConfig() {
+  xiaozhi::AsyncTransportConfig config;
+  config.control_event_queue_depth = 4;
+  config.receive_text_pool_depth = 1;
+  config.receive_binary_pool_depth = 1;
+  config.transmit_control_pool_depth = 3;
+  config.transmit_audio_pool_depth = 2;
+  config.maximum_text_bytes = 4096;
+  config.maximum_binary_bytes = 1275 + 16;
+  config.task_stack_in_psram = true;
+  return config;
+}
+
+xiaozhi::AsyncTransport transport(network_transport, makeTransportConfig());
 
 I2sOpusAudioPort::Config makeAudioConfig() {
   I2sOpusAudioPort::Config config = xiaozhi_audio_board::makeConfig();
+  config.inputTaskStackBytes = 4 * 1024;
+  config.outputTaskStackBytes = 3 * 1024;
+  config.wakeTaskStackBytes = 4 * 1024;
   config.captureLogIntervalPackets = 10;
   config.enableSpeechConditioning = true;
   config.speechGateRms = 300;
@@ -110,8 +130,12 @@ I2sOpusAudioPort::Config makeAudioConfig() {
   config.speechSilenceGain = 0.25f;
   config.speechStartPackets = 2;
   config.speechHoldMs = 420;
-  config.wakeModelKeyword = "nihaoxiaozhi";
+  config.enableWakeDetection = true;
+  config.wakeModelPartition = "model";
+  config.wakeModelKeyword = "wn9_nihaoxiaozhi_tts";
   config.defaultWakeWord = "你好小智";
+  config.wakeDetectionMode = I2sOpusAudioPort::WakeDetectionMode::Balanced;
+  config.captureChannel = I2sOpusAudioPort::CaptureChannel::Auto;
   return config;
 }
 
@@ -122,6 +146,23 @@ namespace {
 
 constexpr char kWifiSsid[] = XIAOZHI_WIFI_SSID;
 constexpr char kWifiPassword[] = XIAOZHI_WIFI_PASSWORD;
+
+void* tlsPsramFirstCalloc(size_t count, size_t size) {
+  if (count != 0 && size > SIZE_MAX / count) {
+    return nullptr;
+  }
+  void* allocation =
+      heap_caps_calloc(count, size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  if (allocation == nullptr) {
+    allocation = heap_caps_calloc(count, size,
+                                  MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+  }
+  return allocation;
+}
+
+void tlsHeapCapsFree(void* allocation) {
+  heap_caps_free(allocation);
+}
 
 constexpr uint16_t kExpressionTransitionMs = 600;
 constexpr uint32_t kChatButtonDebounceMs = 40;
@@ -148,8 +189,8 @@ bool chatButtonStableState = HIGH;
 uint32_t chatButtonChangedMs = 0;
 
 void queueEmotion(xiaozhi::Emotion emotion, const std::string& rawName) {
-  TftRobotEyes::XiaozhiExpression displayExpression;
-  if (!TftRobotEyes::expressionFromName(rawName.c_str(), displayExpression)) {
+  grokEyes::XiaozhiExpression displayExpression;
+  if (!grokEyes::expressionFromName(rawName.c_str(), displayExpression)) {
     Serial.printf("[display] unsupported Xiaozhi emotion: %s\n",
                   rawName.c_str());
     return;
@@ -164,7 +205,7 @@ void queueEmotion(xiaozhi::Emotion emotion, const std::string& rawName) {
   Serial.printf("EMOTION:%u,%s DISPLAY:%u,%s\n",
                 static_cast<unsigned>(emotion), rawName.c_str(),
                 static_cast<unsigned>(displayExpression),
-                TftRobotEyes::expressionName(displayExpression));
+                grokEyes::expressionName(displayExpression));
 }
 
 void receiveEmotion(const xiaozhi::Event& event) {
@@ -347,7 +388,7 @@ void setup() {
   eyesReady = eyes.begin(50);
   if (!eyesReady) {
     tft.fillScreen(TFT_RED);
-    Serial.println("[display] TftRobotEyes sprite allocation failed");
+    Serial.println("[display] grokEyes sprite allocation failed");
     return;
   }
   eyes.setAutoBlink(true, 3000, 1600);
@@ -408,6 +449,12 @@ void setup() {
 #if XIAOZHI_PROTOCOL_VERSION_OVERRIDE != 0
   config.protocol_version = XIAOZHI_PROTOCOL_VERSION_OVERRIDE;
 #endif
+  config.max_json_bytes = 4096;
+  config.max_audio_payload_bytes = 1275;
+  const int tlsAllocatorResult =
+      mbedtls_platform_set_calloc_free(tlsPsramFirstCalloc, tlsHeapCapsFree);
+  Serial.printf("[network] TLS PSRAM allocator: %s\n",
+                tlsAllocatorResult == 0 ? "enabled" : "unavailable");
   const bool aecRequested = XIAOZHI_ENABLE_SERVER_AEC_DEFAULT != 0;
   const bool timedServerAec = config.protocol_version == 2;
   const bool allowUntimestampedAec =

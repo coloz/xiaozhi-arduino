@@ -371,6 +371,9 @@ struct I2sOpusAudioPort::Impl {
   std::atomic<uint32_t> maximumDecodeUs{0};
   std::atomic<uint32_t> maximumWakeDetectUs{0};
   bool wakeDetectionStarted = false;
+  // Owned by the Client task. Delay idle wake listening until local TTS has
+  // drained so the microphone cannot re-detect the device's own reply.
+  bool wakeEnablePendingAfterPlayback = false;
   // A detected word and the control task can both transition wake state. Keep
   // enabled + generation + event publication indivisible so an old detect
   // cannot disable a newly enabled generation (disable -> enable ABA).
@@ -1866,6 +1869,7 @@ struct I2sOpusAudioPort::Impl {
   void stop() {
     captureEnabled.store(false);
     captureGeneration.fetch_add(1);
+    wakeEnablePendingAfterPlayback = false;
     if (queueMutex != nullptr) {
       cancelPlayback();
     }
@@ -3049,6 +3053,10 @@ void I2sOpusAudioPort::loop() {
   if (!impl_->started) {
     return;
   }
+  if (impl_->wakeEnablePendingAfterPlayback && impl_->isPlaybackIdle()) {
+    impl_->wakeEnablePendingAfterPlayback = false;
+    impl_->setWakeDetection(true);
+  }
   impl_->drainUplink();
   impl_->logPerformance();
 }
@@ -3131,9 +3139,16 @@ uint32_t I2sOpusAudioPort::queuedPlaybackMs() const {
 void I2sOpusAudioPort::onClientStateChanged(xiaozhi::State,
                                             xiaozhi::State newState) {
   if (impl_ != nullptr && impl_->started) {
-    // WakeNet lifecycle follows Client state on the Client/Runtime owner task;
-    // delayed UI callbacks are observers only.
-    impl_->setWakeDetection(newState == xiaozhi::State::Idle);
+    // The server can transition to Idle before the local I2S queue has played
+    // its final TTS samples. Defer wake listening until playback is truly idle
+    // so the microphone cannot open a second session from speaker echo.
+    if (newState == xiaozhi::State::Idle && !impl_->isPlaybackIdle()) {
+      impl_->wakeEnablePendingAfterPlayback = true;
+      impl_->setWakeDetection(false);
+    } else {
+      impl_->wakeEnablePendingAfterPlayback = false;
+      impl_->setWakeDetection(newState == xiaozhi::State::Idle);
+    }
   }
 }
 
