@@ -182,6 +182,7 @@ private:
 
 enum class EventType : uint8_t {
     Open,
+    Close,
     Text,
     Binary,
     Reconnecting,
@@ -797,9 +798,19 @@ private:
                 closeWorkerConnection();
                 if (active_generation_.load() == lost_generation &&
                     desired_connected_.load()) {
-                    if (fatal) {
-                        desired_connected_.store(false,
-                                                 std::memory_order_release);
+                    if (fatal || !config_.reconnect_after_disconnect) {
+                        // Serialize with connect() publishing a new desired
+                        // session. An old peer close must not cancel a new wake.
+                        xSemaphoreTake(request_mutex_, portMAX_DELAY);
+                        if (active_generation_.load() == lost_generation) {
+                            desired_connected_.store(false,
+                                                     std::memory_order_release);
+                            if (!fatal) {
+                                enqueueControlEvent(EventType::Close,
+                                                    lost_generation, true);
+                            }
+                        }
+                        xSemaphoreGive(request_mutex_);
                     } else {
                         uint32_t expected_generation = lost_generation;
                         const uint32_t reconnect_generation =
@@ -1098,6 +1109,11 @@ private:
                     callbacks_.on_open();
                 }
                 break;
+            case EventType::Close:
+                if (callbacks_.on_close) {
+                    callbacks_.on_close();
+                }
+                break;
             case EventType::Text:
                 if (callbacks_.on_text) {
                     const PayloadSlot& slot =
@@ -1145,6 +1161,7 @@ private:
                 receive_error_pool_.release(event.payload_slot);
                 break;
             case EventType::Open:
+            case EventType::Close:
             case EventType::Reconnecting:
                 break;
         }

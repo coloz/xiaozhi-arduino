@@ -79,6 +79,7 @@ The same selection can be supplied as a build flag, for example
 | Selection | Board | Audio hardware |
 | --- | --- | --- |
 | `OJ_ESP32S3_BASIC` | OpenJumper ESP32 AIOT Basic (`oj_esp32s3basic`) | ES8311 on shared full-duplex I2S |
+| `OJ_ESP32S3_OJOY` | OpenJumper OJoy ESP32-S3 round AMOLED board | ES8311 on shared full-duplex I2S, GPIO9 PA enable |
 | `NULLLAB_AI_VOX` | first-generation NULLLAB AI VOX | SPH0645 microphone plus an independent I2S amplifier |
 | `NULLLAB_AI_VOX3` | NULLLAB AI-VOX3 | ES8311 on shared full-duplex I2S |
 
@@ -88,6 +89,12 @@ repository's `examples/ai_vox_board`. The separate AI-VOX3 preset follows
 [examples/ai-vox3](https://github.com/nulllaborg/ai_vox/tree/main/examples/ai-vox3).
 Select `NULLLAB_AI_VOX3` before including `Xiaozhi.h`
 for that hardware revision.
+
+For OJoy, select `OJ_ESP32S3_OJOY`. Its ES8311 uses SDA5/SCL4, MCLK6,
+BCLK14, WS12, TX11 (codec DIN), RX13 (codec DOUT), and active-high PA9.
+The [TftEmotionFace OJoy build script](examples/TftEmotionFace/build_ojoy.ps1)
+selects this preset and the CH13613 QSPI 480x480 setup for both TFT_eSPI and
+grokEyes, enables OPI PSRAM, and uploads the Chinese wake model with `-Upload`.
 
 AI-VOX3 uses I2C SDA=13/SCL=12 and Wire address `0x18` (upstream `0x30`
 is an 8-bit address). Shared I2S0 uses MCLK=11, BCLK=10, WS=8, DOUT=7,

@@ -12,6 +12,8 @@
 #endif
 #endif
 #if XIAOZHI_AUDIO_ENABLE_WAKE_ESP_SR
+#include <esp_afe_sr_models.h>
+#include <esp_heap_caps.h>
 #include <esp_wn_iface.h>
 #include <esp_wn_models.h>
 #include <model_path.h>
@@ -362,6 +364,7 @@ struct I2sOpusAudioPort::Impl {
   std::atomic<uint32_t> decodeErrors{0};
   std::atomic<uint32_t> outputErrors{0};
   std::atomic<bool> playbackMuted{true};
+  std::atomic<float> activeMicrophoneGainDb{-1.0f};
   int32_t speakerGainQ15 = 22938;
   uint32_t lastPerformanceLogMs = 0;
   std::array<char, 768> performanceLogBuffer{};
@@ -370,6 +373,21 @@ struct I2sOpusAudioPort::Impl {
   std::atomic<uint32_t> maximumEncodeUs{0};
   std::atomic<uint32_t> maximumDecodeUs{0};
   std::atomic<uint32_t> maximumWakeDetectUs{0};
+  std::atomic<uint32_t> wakeReads{0};
+  std::atomic<uint32_t> wakePartialReads{0};
+  std::atomic<uint32_t> wakeFrames{0};
+  std::atomic<uint32_t> wakeDetections{0};
+  std::atomic<uint32_t> lastWakeDetectionMs{0};
+  std::atomic<uint32_t> wakePeak{0};
+  std::atomic<uint32_t> wakeClippedReads{0};
+  std::atomic<uint32_t> wakeRms{0};
+  std::atomic<uint32_t> wakeReferenceRms{0};
+  std::atomic<uint32_t> wakeCleanRms{0};
+  std::atomic<uint32_t> wakeAecFrames{0};
+  std::atomic<bool> wakeAecActive{false};
+  std::atomic<bool> wakePlaybackExpected{false};
+  std::atomic<uint32_t> maximumWakeAecUs{0};
+  std::atomic<char> wakeChannel{'L'};
   bool wakeDetectionStarted = false;
   // Owned by the Client task. Delay idle wake listening until local TTS has
   // drained so the microphone cannot re-detect the device's own reply.
@@ -393,6 +411,18 @@ struct I2sOpusAudioPort::Impl {
   srmodel_list_t* wakeModels = nullptr;
   const esp_wn_iface_t* wakeNet = nullptr;
   model_iface_data_t* wakeNetData = nullptr;
+  const esp_afe_sr_iface_t* wakeAfe = nullptr;
+  esp_afe_sr_data_t* wakeAfeData = nullptr;
+  const char* wakeModelWords = nullptr;
+  std::vector<int16_t> wakeAfeFeed;
+  size_t wakeAfeSamples = 0;
+  TaskHandle_t wakeAfeFetchTask = nullptr;
+  SemaphoreHandle_t wakeAfeFeedMutex = nullptr;
+  std::atomic<bool> wakeAfeFetchExited{true};
+  std::atomic<bool> wakeAfeResetRequested{true};
+  std::atomic<uint32_t> wakeAfeReadyGeneration{0};
+  std::vector<int16_t> wakeReferenceMono;
+  CaptureResamplerState wakeReferenceResampler;
 #endif
 
   void notifyAudioEvent() {
@@ -679,6 +709,14 @@ struct I2sOpusAudioPort::Impl {
       return false;
 #else
       const Es8311Control& es8311 = hardware.es8311;
+      if (es8311.playbackMicrophoneGainDb != -1.0f &&
+          (!std::isfinite(es8311.playbackMicrophoneGainDb) ||
+           es8311.playbackMicrophoneGainDb < 0.0f ||
+           es8311.playbackMicrophoneGainDb > 42.0f ||
+           es8311.playbackMicrophoneGainDb > es8311.microphoneGainDb)) {
+        error = "ES8311 playback microphone gain must be -1 or 0..normal gain (max 42 dB)";
+        return false;
+      }
       const bool invalidI2c =
           es8311.initializeWire &&
           (es8311.i2cSda < 0 || es8311.i2cScl < 0 ||
@@ -994,6 +1032,20 @@ struct I2sOpusAudioPort::Impl {
 #endif
   }
 
+#if XIAOZHI_AUDIO_ENABLE_CODEC_ES8311
+  // Owned by codecMutex at runtime; initialization runs before audio workers.
+  bool setEs8311MicrophoneGain(float gainDb) {
+    if (activeMicrophoneGainDb.load() == gainDb) { return true; }
+    if (codec->set_mic_gain(codec, gainDb) != ESP_CODEC_DEV_OK) {
+      Serial.println("[audio] ES8311 microphone gain change failed");
+      return false;
+    }
+    activeMicrophoneGainDb.store(gainDb);
+    Serial.printf("[audio] ES8311 microphone gain=%.0f dB\n", gainDb);
+    return true;
+  }
+#endif
+
   bool setCodecMuted(bool muted) {
     if (externalCodecStarted) {
       return config.codec.setMuted(config.codec.context, muted);
@@ -1016,7 +1068,18 @@ struct I2sOpusAudioPort::Impl {
     if (muted && es8311.paPin >= 0) {
       digitalWrite(es8311.paPin, !es8311.paActiveLevel);
     }
+    // Prevent ADC saturation before the first loud playback sample. Changing
+    // digital PCM gain after capture cannot recover an already clipped input.
+    const bool switchInputGain = es8311.playbackMicrophoneGainDb >= 0.0f;
+    if (!muted && switchInputGain &&
+        !setEs8311MicrophoneGain(es8311.playbackMicrophoneGainDb)) {
+      return false;
+    }
     const bool changed = codec->mute(codec, muted) == ESP_CODEC_DEV_OK;
+    if (changed && muted && switchInputGain &&
+        !setEs8311MicrophoneGain(es8311.microphoneGainDb)) {
+      return false;
+    }
     if (changed && !muted && es8311.paPin >= 0) {
       digitalWrite(es8311.paPin, es8311.paActiveLevel);
     }
@@ -1169,6 +1232,7 @@ struct I2sOpusAudioPort::Impl {
                     fsResult, gainResult, volumeResult, enableResult);
       return false;
     }
+    activeMicrophoneGainDb.store(es8311.microphoneGainDb);
     // BOTH enables ADC and DAC at the same time.  Keep the DAC muted until a
     // decoded speech packet arrives so an idle TX FIFO cannot become hiss.
     if (!setCodecMuted(true)) {
@@ -1280,6 +1344,236 @@ struct I2sOpusAudioPort::Impl {
     static_cast<Impl*>(context)->wakeLoop();
   }
 
+  bool beginWakeAfe(char* modelName) {
+    if (inputChannels != 2 || captureFormat.sample_rate != 16000 ||
+        config.captureChannel != CaptureChannel::Left ||
+        (config.hardware.codecMode == CodecMode::Es8311 &&
+         config.hardware.es8311.noDacReference)) {
+      Serial.println("[wake] AFE requires 16 kHz microphone L + playback reference R");
+      return false;
+    }
+    // Keep the original engine's feed/fetch ownership and integrated WakeNet.
+    // This stream is used only for wake recognition, so use SR's linear AEC
+    // rather than the VOIP path intended for call audio.
+    afe_config_t* afeConfig = afe_config_init("MR", wakeModels, AFE_TYPE_SR,
+                                               AFE_MODE_HIGH_PERF);
+    if (afeConfig == nullptr) {
+      return false;
+    }
+    // MR is one physical microphone and one DAC reference, not two mics.
+    if (afeConfig->pcm_config.mic_num != 1 || afeConfig->pcm_config.ref_num != 1) {
+      afe_config_free(afeConfig);
+      Serial.println("[wake] AFE microphone/reference mapping is invalid");
+      return false;
+    }
+    afeConfig->aec_init = true;
+    afeConfig->aec_mode = AEC_MODE_SR_HIGH_PERF;
+    afeConfig->ns_init = false;
+    afeConfig->vad_init = false;
+    afeConfig->agc_init = false;
+    afeConfig->wakenet_init = true;
+    afeConfig->wakenet_model_name = modelName;
+    afeConfig->wakenet_mode = config.wakeDetectionMode == WakeDetectionMode::Aggressive
+                                 ? DET_MODE_95 : DET_MODE_90;
+    afeConfig->memory_alloc_mode = AFE_MEMORY_ALLOC_MORE_PSRAM;
+    afeConfig->afe_ringbuf_size = 4;
+    wakeAfe = esp_afe_handle_from_config(afeConfig);
+    if (wakeAfe != nullptr) {
+      wakeAfeData = wakeAfe->create_from_config(afeConfig);
+    }
+    afe_config_free(afeConfig);
+    if (wakeAfeData == nullptr) {
+      Serial.println("[wake] AFE allocation failed");
+      return false;
+    }
+    if (config.wakeDetectionThreshold != 0.0f) {
+      if (wakeAfe->set_wakenet_threshold == nullptr ||
+          wakeAfe->set_wakenet_threshold(wakeAfeData, 1,
+                                        config.wakeDetectionThreshold) != 1) {
+        Serial.println("[wake] AFE threshold configuration failed");
+        return false;
+      }
+      Serial.printf("[wake] detection threshold=%.3f\n", config.wakeDetectionThreshold);
+    }
+    const int samples = wakeAfe->get_feed_chunksize(wakeAfeData);
+    if (samples <= 0 || wakeAfe->get_feed_channel_num(wakeAfeData) != 2 ||
+        wakeAfe->get_samp_rate(wakeAfeData) != 16000) {
+      return false;
+    }
+    wakeAfeFeed.resize(static_cast<size_t>(samples) * 2);
+    wakeAfeFeedMutex = xSemaphoreCreateMutex();
+    if (wakeAfeFeedMutex == nullptr) {
+      return false;
+    }
+    wakeReferenceMono.resize(wakeMono.size());
+    wakeAfeSamples = 0;
+    wakeModelWords = esp_srmodel_get_wake_words(wakeModels, modelName);
+    // As in AfeAudioEngine::Initialize(), create the algorithms disabled;
+    // their fetch owner applies runtime controls before accepting new feed.
+    wakeAfe->disable_wakenet(wakeAfeData);
+    wakeAfe->disable_aec(wakeAfeData);
+    wakeAecActive.store(false);
+    wakeAfe->print_pipeline(wakeAfeData);
+    Serial.printf("[wake] AFE ready: microphones=1 mic=L ref=R feed=%d fetch=%d\n", samples,
+                  wakeAfe->get_fetch_chunksize(wakeAfeData));
+    return true;
+  }
+
+  void publishWakeWord(uint32_t generation, const char* word) {
+    if (word == nullptr || word[0] == '\0') {
+      word = config.defaultWakeWord;
+    }
+    // Model metadata separates multiple keywords with semicolons.
+    size_t length = 0;
+    while (word[length] != '\0' && word[length] != ';' &&
+           length < sizeof(lastWakeWord) - 1) {
+      ++length;
+    }
+    std::copy_n(word, length, lastWakeWord);
+    lastWakeWord[length] = '\0';
+    bool committed = false;
+    portENTER_CRITICAL(&wakeStateMux);
+    if (wakeTaskRunning.load() && wakeDetectionEnabled.load() &&
+        generation == wakeGeneration.load()) {
+      wakeDetectionEnabled.store(false);
+      wakeDetectedGeneration.store(generation);
+      wakeDetected.store(true);
+      committed = true;
+    }
+    portEXIT_CRITICAL(&wakeStateMux);
+    if (!committed) {
+      return;
+    }
+    lastWakeDetectionMs.store(millis());
+    ++wakeDetections;
+    auto* sink = realtimeControlSink.load(std::memory_order_acquire);
+    if (sink != nullptr && sink->notifyWakeWordDetected(lastWakeWord, length)) {
+      portENTER_CRITICAL(&wakeStateMux);
+      if (wakeDetected.load() && wakeDetectedGeneration.load() == generation) {
+        wakeDetected.store(false);
+        wakeDetectedGeneration.store(0);
+      }
+      portEXIT_CRITICAL(&wakeStateMux);
+    }
+  }
+
+  void feedWakeAfe(uint32_t generation) {
+    char channel;
+    uint32_t peak, rms;
+    resampleCapture(wakeCaptured.data(), wakeCaptured.size() / inputChannels,
+                    wakeReferenceMono, wakeReferenceResampler, channel, peak, rms,
+                    true, 1);
+    wakeReferenceRms.store(rms);
+    for (size_t index = 0; index < wakeMono.size(); ++index) {
+      wakeAfeFeed[wakeAfeSamples++] = wakeMono[index];
+      wakeAfeFeed[wakeAfeSamples++] = wakeReferenceMono[index];
+      if (wakeAfeSamples == wakeAfeFeed.size()) {
+        const uint32_t startedUs = micros();
+        xSemaphoreTake(wakeAfeFeedMutex, portMAX_DELAY);
+        if (wakeDetectionEnabled.load() && generation == wakeGeneration.load()) {
+          if (config.wakeAudioObserver != nullptr) {
+            config.wakeAudioObserver(wakeAfeFeed.data(), wakeAfeFeed.size(), false);
+          }
+          wakeAfe->feed(wakeAfeData, wakeAfeFeed.data());
+        }
+        xSemaphoreGive(wakeAfeFeedMutex);
+        updateMaximum(maximumWakeAecUs, micros() - startedUs);
+        ++wakeAecFrames;
+        wakeAfeSamples = 0;
+      }
+    }
+  }
+
+  static void wakeAfeFetchEntry(void* context) {
+    static_cast<Impl*>(context)->wakeAfeFetchLoop();
+  }
+
+  bool wakeAecNeeded() const {
+    return !config.wakeAecDuringPlaybackOnly || wakePlaybackExpected.load() ||
+           !playbackMuted.load();
+  }
+
+  // Called only by the fetch owner, with feed excluded. Keep AEC active
+  // through the local playback tail even if the server has left Speaking.
+  void applyWakeAec(bool enabled) {
+    if (enabled == wakeAecActive.load()) { return; }
+    if (enabled) {
+      wakeAfe->enable_aec(wakeAfeData);
+    } else {
+      wakeAfe->disable_aec(wakeAfeData);
+    }
+    wakeAecActive.store(enabled);
+    Serial.printf("[wake] AEC %s\n", enabled ? "on" : "off");
+  }
+
+  void wakeAfeFetchLoop() {
+    bool wakenetEnabled = false;
+    while (wakeTaskRunning.load()) {
+      if (!wakeDetectionEnabled.load()) {
+        if (wakenetEnabled) {
+          xSemaphoreTake(wakeAfeFeedMutex, portMAX_DELAY);
+          wakeAfe->disable_wakenet(wakeAfeData);
+          applyWakeAec(false);
+          xSemaphoreGive(wakeAfeFeedMutex);
+          wakenetEnabled = false;
+        }
+        ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(50));
+        continue;
+      }
+      const uint32_t generation = wakeGeneration.load();
+      if (wakeAfeResetRequested.exchange(false)) {
+        // Feed may run on the other core. Serialize reset against feed, while
+        // fetch and enable_wakenet remain owned exclusively by this task.
+        xSemaphoreTake(wakeAfeFeedMutex, portMAX_DELAY);
+        wakeAfe->disable_wakenet(wakeAfeData);
+        wakeAfe->reset_buffer(wakeAfeData);
+        wakeAfe->enable_wakenet(wakeAfeData);
+        applyWakeAec(wakeAecNeeded());
+        wakenetEnabled = true;
+        xSemaphoreGive(wakeAfeFeedMutex);
+        wakeAfeReadyGeneration.store(generation);
+      }
+      if (wakeAecNeeded() != wakeAecActive.load()) {
+        xSemaphoreTake(wakeAfeFeedMutex, portMAX_DELAY);
+        applyWakeAec(wakeAecNeeded());
+        xSemaphoreGive(wakeAfeFeedMutex);
+      }
+      const uint32_t startedUs = micros();
+      // Match AfeAudioEngine's independent, blocking fetch. Use a bounded
+      // timeout so shutdown and a generation change are observed promptly.
+      auto* result = wakeAfe->fetch_with_delay(wakeAfeData, pdMS_TO_TICKS(50));
+      if (!wakeTaskRunning.load() || !wakeDetectionEnabled.load() ||
+          generation != wakeGeneration.load()) {
+        continue;
+      }
+      if (result == nullptr || result->ret_value == ESP_FAIL || result->data_size <= 0) {
+        continue;
+      }
+      updateMaximum(maximumWakeDetectUs, micros() - startedUs);
+      ++wakeFrames;
+      uint64_t energy = 0;
+      const size_t samples = result->data_size / sizeof(int16_t);
+      if (config.wakeAudioObserver != nullptr) {
+        config.wakeAudioObserver(result->data, samples, true);
+      }
+      for (size_t index = 0; index < samples; ++index) {
+        const int32_t sample = result->data[index];
+        energy += static_cast<uint64_t>(sample * sample);
+      }
+      wakeCleanRms.store(static_cast<uint32_t>(std::sqrt(
+          static_cast<double>(energy) / samples)));
+      if (result->wakeup_state == WAKENET_DETECTED) {
+        const char* word = wakeModelWords;
+        for (int index = 1; word != nullptr && index < result->wake_word_index; ++index) {
+          word = strchr(word, ';');
+          if (word != nullptr) { ++word; }
+        }
+        publishWakeWord(generation, word);
+      }
+    }
+    wakeAfeFetchExited.store(true);
+    vTaskSuspend(nullptr);
+  }
   void wakeLoop() {
     while (wakeTaskRunning.load()) {
       if (!wakeDetectionEnabled.load()) {
@@ -1296,6 +1590,12 @@ struct I2sOpusAudioPort::Impl {
         // Control code only publishes this request, avoiding clear/detect races.
         wakePcm.clear();
         wakeResampler.initialized = false;
+        wakeReferenceResampler.initialized = false;
+        wakeAfeSamples = 0;
+      }
+      if (wakeAfeData != nullptr && wakeAfeReadyGeneration.load() != generation) {
+        vTaskDelay(1);
+        continue;
       }
 
       size_t inputSamples = 0;
@@ -1313,6 +1613,7 @@ struct I2sOpusAudioPort::Impl {
         continue;
       }
       if (result != ESP_OK || inputSamples != wakeCaptured.size()) {
+        ++wakePartialReads;
         vTaskDelay(pdMS_TO_TICKS(10));
         continue;
       }
@@ -1321,7 +1622,16 @@ struct I2sOpusAudioPort::Impl {
       uint32_t peak = 0;
       uint32_t rms = 0;
       resampleCapture(wakeCaptured.data(), wakeCaptured.size() / inputChannels,
-                      wakeMono, wakeResampler, channel, peak, rms, false);
+                      wakeMono, wakeResampler, channel, peak, rms);
+      ++wakeReads;
+      wakePeak.store(peak);
+      if (peak >= 32760) { ++wakeClippedReads; }
+      wakeRms.store(rms);
+      wakeChannel.store(channel);
+      if (wakeAfeData != nullptr) {
+        feedWakeAfe(generation);
+        continue;
+      }
       wakePcm.insert(wakePcm.end(), wakeMono.begin(), wakeMono.end());
 
       while (wakeDetectionEnabled.load() &&
@@ -1333,6 +1643,7 @@ struct I2sOpusAudioPort::Impl {
         wakePcm.erase(wakePcm.begin(), wakePcm.begin() + wakeChunkSamples);
         const uint32_t detectStartedUs = micros();
         const int detected = wakeNet->detect(wakeNetData, wakeDetectChunk.data());
+        ++wakeFrames;
         updateMaximum(maximumWakeDetectUs, micros() - detectStartedUs);
         if (!wakeTaskRunning.load() || !wakeDetectionEnabled.load() ||
             generation != wakeGeneration.load()) {
@@ -1341,39 +1652,7 @@ struct I2sOpusAudioPort::Impl {
         if (detected <= 0) {
           continue;
         }
-        const char* word = wakeNet->get_word_name(wakeNetData, detected);
-        snprintf(lastWakeWord, sizeof(lastWakeWord), "%s",
-                 word == nullptr || word[0] == '\0' ? config.defaultWakeWord : word);
-        bool committed = false;
-        portENTER_CRITICAL(&wakeStateMux);
-        if (wakeTaskRunning.load() && wakeDetectionEnabled.load() &&
-            generation == wakeGeneration.load()) {
-          wakeDetectionEnabled.store(false);
-          wakeDetectedGeneration.store(generation);
-          wakeDetected.store(true);
-          committed = true;
-        }
-        portEXIT_CRITICAL(&wakeStateMux);
-        if (!committed) {
-          continue;
-        }
-        xiaozhi::RealtimeControlSink* sink =
-            realtimeControlSink.load(std::memory_order_acquire);
-        if (sink != nullptr) {
-          size_t wordSize = 0;
-          while (wordSize < sizeof(lastWakeWord) && lastWakeWord[wordSize] != '\0') {
-            ++wordSize;
-          }
-          if (sink->notifyWakeWordDetected(lastWakeWord, wordSize)) {
-            portENTER_CRITICAL(&wakeStateMux);
-            if (wakeDetected.load() &&
-                wakeDetectedGeneration.load() == generation) {
-              wakeDetected.store(false);
-              wakeDetectedGeneration.store(0);
-            }
-            portEXIT_CRITICAL(&wakeStateMux);
-          }
-        }
+        publishWakeWord(generation, wakeNet->get_word_name(wakeNetData, detected));
         wakePcm.clear();
         break;
       }
@@ -1397,34 +1676,49 @@ struct I2sOpusAudioPort::Impl {
     }
     char* modelName = esp_srmodel_filter(
         wakeModels, ESP_WN_PREFIX, config.wakeModelKeyword);
-    if (modelName == nullptr ||
-        (wakeNet = static_cast<const esp_wn_iface_t*>(
-             esp_wn_handle_from_name(modelName))) == nullptr ||
-        (wakeNetData = wakeNet->create(
-             modelName, config.wakeDetectionMode == WakeDetectionMode::Aggressive
-                            ? DET_MODE_95
-                            : DET_MODE_90)) == nullptr) {
-      Serial.printf("[wake] WakeNet model initialization failed (wanted=%s)\n",
-                    config.wakeModelKeyword == nullptr
-                        ? "first available model"
-                        : config.wakeModelKeyword);
-      return false;
+    int sampleRate = 16000;
+    int chunkSamples = 0;
+    if (config.enableWakeAec) {
+      if (modelName == nullptr || !beginWakeAfe(modelName)) {
+        return false;
+      }
+      chunkSamples = wakeAfe->get_fetch_chunksize(wakeAfeData);
+    } else {
+      if (modelName == nullptr ||
+          (wakeNet = static_cast<const esp_wn_iface_t*>(
+               esp_wn_handle_from_name(modelName))) == nullptr ||
+          (wakeNetData = wakeNet->create(
+               modelName, config.wakeDetectionMode == WakeDetectionMode::Aggressive
+                              ? DET_MODE_95
+                              : DET_MODE_90)) == nullptr) {
+        Serial.printf("[wake] WakeNet model initialization failed (wanted=%s)\n",
+                      config.wakeModelKeyword == nullptr
+                          ? "first available model"
+                          : config.wakeModelKeyword);
+        return false;
+      }
+      sampleRate = wakeNet->get_samp_rate(wakeNetData);
+      if (config.wakeDetectionThreshold != 0.0f &&
+          (wakeNet->set_det_threshold == nullptr ||
+           wakeNet->set_det_threshold(wakeNetData, config.wakeDetectionThreshold, 1) != 1)) {
+        Serial.println("[wake] WakeNet threshold configuration failed");
+        return false;
+      }
+      chunkSamples = wakeNet->get_samp_chunksize(wakeNetData);
+      const int channels = wakeNet->get_channel_num == nullptr
+                               ? 0
+                               : wakeNet->get_channel_num(wakeNetData);
+      if (sampleRate != static_cast<int>(captureFormat.sample_rate) ||
+          chunkSamples <= 0 || channels != 1) {
+        Serial.printf("[wake] unsupported model format: rate=%d chunk=%d channels=%d\n",
+                      sampleRate, chunkSamples, channels);
+        return false;
+      }
+      wakeChunkSamples = static_cast<size_t>(chunkSamples);
+      wakeDetectChunk.resize(wakeChunkSamples);
+      wakePcm.clear();
+      wakePcm.reserve(wakeChunkSamples + wakeMono.size());
     }
-    const int sampleRate = wakeNet->get_samp_rate(wakeNetData);
-    const int chunkSamples = wakeNet->get_samp_chunksize(wakeNetData);
-    const int channels = wakeNet->get_channel_num == nullptr
-                             ? 0
-                             : wakeNet->get_channel_num(wakeNetData);
-    if (sampleRate != static_cast<int>(captureFormat.sample_rate) ||
-        chunkSamples <= 0 || channels != 1) {
-      Serial.printf("[wake] unsupported model format: rate=%d chunk=%d channels=%d\n",
-                    sampleRate, chunkSamples, channels);
-      return false;
-    }
-    wakeChunkSamples = static_cast<size_t>(chunkSamples);
-    wakeDetectChunk.resize(wakeChunkSamples);
-    wakePcm.clear();
-    wakePcm.reserve(wakeChunkSamples + wakeMono.size());
     wakeTaskRunning.store(true);
     wakeTaskExited.store(false);
     if (xTaskCreatePinnedToCore(wakeTaskEntry, "wakenet", config.wakeTaskStackBytes,
@@ -1432,8 +1726,23 @@ struct I2sOpusAudioPort::Impl {
                                 config.wakeTaskCore) != pdPASS) {
       wakeTaskRunning.store(false);
       wakeTaskExited.store(true);
-      Serial.println("[wake] failed to create WakeNet task");
+      Serial.printf("[wake] failed to create WakeNet task: heap=%lu maxblk=%lu stack=%lu\n",
+                    static_cast<unsigned long>(ESP.getFreeHeap()),
+                    static_cast<unsigned long>(ESP.getMaxAllocHeap()),
+                    static_cast<unsigned long>(config.wakeTaskStackBytes));
       return false;
+    }
+    if (wakeAfeData != nullptr) {
+      wakeAfeFetchExited.store(false);
+      // Separate the blocking fetch/WakeNet work from I2S feed, as the
+      // reference AudioService + AfeAudioEngine do. One task still owns RX.
+      if (xTaskCreatePinnedToCore(wakeAfeFetchEntry, "wake_fetch", config.wakeTaskStackBytes,
+                                  this, config.wakeTaskPriority, &wakeAfeFetchTask,
+                                  config.wakeTaskCore == 0 ? 1 : 0) != pdPASS) {
+        wakeAfeFetchExited.store(true);
+        Serial.println("[wake] failed to create AFE fetch task");
+        return false;
+      }
     }
     wakeDetectionStarted = true;
     Serial.printf("[wake] WakeNet ready: model=%s rate=%d chunk=%d\n",
@@ -1454,6 +1763,7 @@ struct I2sOpusAudioPort::Impl {
       wakeDetectedGeneration.store(0);
       if (enabled) {
         wakeResetRequested.store(true);
+        wakeAfeResetRequested.store(true);
       }
       wakeDetectionEnabled.store(enabled);
       changed = true;
@@ -1465,6 +1775,9 @@ struct I2sOpusAudioPort::Impl {
     if (enabled) {
       if (wakeTask != nullptr) {
         xTaskNotifyGive(wakeTask);
+      }
+      if (wakeAfeFetchTask != nullptr) {
+        xTaskNotifyGive(wakeAfeFetchTask);
       }
       return;
     }
@@ -1494,7 +1807,7 @@ struct I2sOpusAudioPort::Impl {
 
   void stopWakeDetection() {
     if (!wakeDetectionStarted && wakeTask == nullptr && wakeNetData == nullptr &&
-        wakeModels == nullptr) {
+        wakeModels == nullptr && wakeAfeData == nullptr) {
       return;
     }
     portENTER_CRITICAL(&wakeStateMux);
@@ -1507,7 +1820,11 @@ struct I2sOpusAudioPort::Impl {
     if (wakeTask != nullptr) {
       xTaskNotifyGive(wakeTask);
     }
-    for (int attempt = 0; attempt < 100 && !wakeTaskExited.load(); ++attempt) {
+    if (wakeAfeFetchTask != nullptr) {
+      xTaskNotifyGive(wakeAfeFetchTask);
+    }
+    for (int attempt = 0; attempt < 100 &&
+         (!wakeTaskExited.load() || !wakeAfeFetchExited.load()); ++attempt) {
       delay(10);
     }
     if (wakeTask != nullptr) {
@@ -1515,6 +1832,25 @@ struct I2sOpusAudioPort::Impl {
     }
     wakeTask = nullptr;
     wakeTaskExited.store(true);
+    if (wakeAfeFetchTask != nullptr) {
+      vTaskDelete(wakeAfeFetchTask);
+      wakeAfeFetchTask = nullptr;
+    }
+    wakeAfeFetchExited.store(true);
+    if (wakeAfeData != nullptr) {
+      wakeAfe->destroy(wakeAfeData);
+      wakeAfeData = nullptr;
+    }
+    wakeAfe = nullptr;
+    if (wakeAfeFeedMutex != nullptr) {
+      vSemaphoreDelete(wakeAfeFeedMutex);
+      wakeAfeFeedMutex = nullptr;
+    }
+    wakeAfeReadyGeneration.store(0);
+    wakeModelWords = nullptr;
+    wakeAfeSamples = 0;
+    releaseVector(wakeAfeFeed);
+    releaseVector(wakeReferenceMono);
     if (wakeNetData != nullptr) {
       wakeNet->destroy(wakeNetData);
       wakeNetData = nullptr;
@@ -1941,9 +2277,11 @@ struct I2sOpusAudioPort::Impl {
                        std::vector<int16_t>& output,
                        CaptureResamplerState& resampler, char& selectedChannel,
                        uint32_t& peak, uint32_t& rms,
-                       bool collectMetrics = true) {
+                       bool collectMetrics = true, int fixedChannel = -1) {
     size_t channel = 0;
-    if (inputChannels == 2) {
+    if (fixedChannel >= 0) {
+      channel = static_cast<size_t>(fixedChannel);
+    } else if (inputChannels == 2) {
       if (config.captureChannel == CaptureChannel::Right) {
         channel = 1;
       } else if (config.captureChannel == CaptureChannel::Auto) {
@@ -2944,7 +3282,10 @@ bool I2sOpusAudioPort::begin(const xiaozhi::AudioFormat& captureFormat, Uplink u
   const bool validWakeConfig = !config.enableWakeDetection ||
                                 (config.wakeModelPartition != nullptr &&
                                  config.defaultWakeWord != nullptr &&
-                                 config.wakeTaskStackBytes > 0);
+                                 config.wakeTaskStackBytes > 0 &&
+                                 (config.wakeDetectionThreshold == 0.0f ||
+                                  (config.wakeDetectionThreshold >= 0.4f &&
+                                   config.wakeDetectionThreshold <= 0.9999f)));
   const bool validPipelineConfig =
       config.mclkMultiple > 0 &&
       config.dmaDescriptorCount > 0 && config.dmaFrames > 0 &&
@@ -3069,6 +3410,9 @@ void I2sOpusAudioPort::setCaptureEnabled(bool enabled) {
     if (impl_->captureEnabled.load()) {
       return;
     }
+    // Transfer RX ownership before waking the uplink input task. This also
+    // covers Realtime sessions that enable capture after entering Speaking.
+    impl_->setWakeDetection(false);
     // Capture-owned state is reset by the input task, avoiding a race with a
     // packet that was already being conditioned when the session changed.
     impl_->captureResetRequested.store(true);
@@ -3139,15 +3483,27 @@ uint32_t I2sOpusAudioPort::queuedPlaybackMs() const {
 void I2sOpusAudioPort::onClientStateChanged(xiaozhi::State,
                                             xiaozhi::State newState) {
   if (impl_ != nullptr && impl_->started) {
+    // In AutoStop/ManualStop, Client disables uplink capture before entering
+    // Speaking. WakeNet can then own RX while the output task continues TX.
+    // Realtime capture must retain all RX samples for server AEC/VAD; never
+    // let the two readers divide that stream between them.
+    impl_->wakePlaybackExpected.store(newState == xiaozhi::State::Speaking);
+    const bool playbackActive = !impl_->isPlaybackIdle();
+    const bool interruptibleSpeech = impl_->config.enableWakeWordInterruption &&
+        !impl_->captureEnabled.load() &&
+        (newState == xiaozhi::State::Speaking ||
+         ((newState == xiaozhi::State::Listening || newState == xiaozhi::State::Idle) &&
+          playbackActive));
     // The server can transition to Idle before the local I2S queue has played
     // its final TTS samples. Defer wake listening until playback is truly idle
     // so the microphone cannot open a second session from speaker echo.
-    if (newState == xiaozhi::State::Idle && !impl_->isPlaybackIdle()) {
+    if (newState == xiaozhi::State::Idle && playbackActive && !interruptibleSpeech) {
       impl_->wakeEnablePendingAfterPlayback = true;
       impl_->setWakeDetection(false);
     } else {
       impl_->wakeEnablePendingAfterPlayback = false;
-      impl_->setWakeDetection(newState == xiaozhi::State::Idle);
+      impl_->setWakeDetection(newState == xiaozhi::State::Idle ||
+                              interruptibleSpeech);
     }
   }
 }
@@ -3182,4 +3538,29 @@ void I2sOpusAudioPort::setWakeDetectionEnabled(bool enabled) {
 
 bool I2sOpusAudioPort::consumeWakeWord(std::string& wakeWord) {
   return impl_ != nullptr && impl_->started && impl_->consumeWake(wakeWord);
+}
+
+I2sOpusAudioPort::WakeStats I2sOpusAudioPort::wakeStats() const {
+  WakeStats stats;
+  if (impl_ != nullptr) {
+    stats.enabled = impl_->wakeDetectionEnabled.load();
+    stats.capturing = impl_->captureEnabled.load();
+    stats.aecActive = impl_->wakeAecActive.load();
+    stats.reads = impl_->wakeReads.load();
+    stats.partialReads = impl_->wakePartialReads.load();
+    stats.clippedReads = impl_->wakeClippedReads.load();
+    stats.microphoneGainDb = impl_->activeMicrophoneGainDb.load();
+    stats.frames = impl_->wakeFrames.load();
+    stats.detections = impl_->wakeDetections.load();
+    stats.lastDetectionMs = impl_->lastWakeDetectionMs.load();
+    stats.peak = impl_->wakePeak.load();
+    stats.rms = impl_->wakeRms.load();
+    stats.captureRms = impl_->latestCaptureRawRms.load();
+    stats.referenceRms = impl_->wakeReferenceRms.load();
+    stats.cleanRms = impl_->wakeCleanRms.load();
+    stats.aecFrames = impl_->wakeAecFrames.load();
+    stats.maximumAecUs = impl_->maximumWakeAecUs.load();
+    stats.channel = impl_->wakeChannel.load();
+  }
+  return stats;
 }

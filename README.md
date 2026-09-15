@@ -78,10 +78,13 @@ Profile 选择、所需引脚和适用限制见 [AUDIO_PROFILES.md](AUDIO_PROFIL
 | 选择值 | 开发板 | 音频硬件 |
 | --- | --- | --- |
 | `OJ_ESP32S3_BASIC` | OpenJumper ESP32 AIOT Basic（`oj_esp32s3basic`） | ES8311，共享全双工 I2S |
+| `OJ_ESP32S3_OJOY` | OpenJumper OJoy ESP32-S3 圆屏板 | ES8311，共享全双工 I2S，GPIO9 功放使能 |
 | `NULLLAB_AI_VOX` | NULLLAB AI VOX 一代 | SPH0645 麦克风 + 独立 I2S 功放 |
 | `NULLLAB_AI_VOX3` | NULLLAB AI-VOX3 | ES8311，共享全双工 I2S |
 
 两个 TFT 完整语音示例默认显式选择 `OJ_ESP32S3_BASIC`。
+OJoy 使用 `OJ_ESP32S3_OJOY`；CH13613 QSPI 圆屏、grokEyes 和构建/烧录步骤见
+[TftEmotionFace 的 OJoy 说明](examples/TftEmotionFace/README.md#ojoy-圆屏开发板)。
 AI VOX 一代预设对应 [ai_vox 的 examples/ai_vox_board](https://github.com/nulllaborg/ai_vox/tree/main/examples/ai_vox_board)；
 AI-VOX3 预设对应 [examples/ai-vox3](https://github.com/nulllaborg/ai_vox/tree/main/examples/ai-vox3)。两者引脚不同，请按硬件版本选择。
 

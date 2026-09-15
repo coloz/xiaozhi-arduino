@@ -9,6 +9,7 @@
 #define OJ_ESP32S3_BASIC 1
 #define NULLLAB_AI_VOX 2
 #define NULLLAB_AI_VOX3 3
+#define OJ_ESP32S3_OJOY 4
 
 #ifndef XIAOZHI_BOARD
 #define XIAOZHI_BOARD OJ_ESP32S3_BASIC
@@ -20,6 +21,8 @@
 #include "NullLabAiVox.h"
 #elif XIAOZHI_BOARD == NULLLAB_AI_VOX3
 #include "NullLabAiVox3.h"
+#elif XIAOZHI_BOARD == OJ_ESP32S3_OJOY
+#include "OjEsp32S3Ojoy.h"
 #elif XIAOZHI_BOARD == CUSTOM_BOARD
 // Define BOARD_AUDIO_* and XIAOZHI_AUDIO_PROFILE before including this header.
 #else

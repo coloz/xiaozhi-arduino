@@ -22,6 +22,10 @@ struct AsyncTransportConfig {
     // Checked after the wrapped synchronous connect() returns. This rejects a
     // late connection; it cannot interrupt a blocked TCP/TLS dependency.
     uint32_t connect_timeout_ms = 10000;
+    // Some services close an established socket to end a voice session.
+    // false forwards on_close so Client returns to Idle; connect retries are
+    // unaffected. true preserves automatic recovery of an active session.
+    bool reconnect_after_disconnect = true;
     uint16_t reconnect_initial_delay_ms = 250;
     uint16_t reconnect_max_delay_ms = 5000;
 

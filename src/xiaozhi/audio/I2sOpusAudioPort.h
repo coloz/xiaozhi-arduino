@@ -203,6 +203,10 @@ class I2sOpusAudioPort final : public xiaozhi::EncodedAudioPort {
     float codecDacVoltage = 3.3f;
     float paGainDb = 0.0f;
     float microphoneGainDb = 30.0f;
+    // Optional ES8311 PGA gain while the speaker is unmuted (0..42 dB).
+    // -1 keeps microphoneGainDb throughout. Applied before enabling the PA;
+    // normal input gain is restored after muting. Hardware uses 6 dB steps.
+    float playbackMicrophoneGainDb = -1.0f;
     float outputVolumeDb = -12.0f;
   };
 
@@ -352,12 +356,32 @@ class I2sOpusAudioPort final : public xiaozhi::EncodedAudioPort {
     // Wake-word detection is optional, which lets boards without a compatible
     // model partition use the same audio port.
     bool enableWakeDetection = XIAOZHI_AUDIO_ENABLE_WAKE_ESP_SR != 0;
+    // Run local WakeNet during half-duplex TTS so a wake word can abort speech.
+    // Realtime uplink capture owns RX exclusively and takes precedence; this
+    // option does not require server AEC or a timestamped WebSocket protocol.
+    bool enableWakeWordInterruption = false;
+    // Echo-cancel the wake stream using synchronous stereo RX: microphone L,
+    // playback reference R. ES8311 requires noDacReference=false. This local
+    // processing is independent of server AEC and never uploads the reference.
+    bool enableWakeAec = false;
+    // With a codec-internal DAC reference, bypass AEC while the speaker is
+    // inactive. AFE still runs WakeNet on the single microphone. Leave false
+    // when the reference can contain playback from outside this AudioPort.
+    bool wakeAecDuringPlaybackOnly = false;
+    // Optional local AFE diagnostic tap. Input is interleaved mic/reference;
+    // processed output is mono. Both are PCM16 at 16 kHz. Called from two
+    // different audio tasks: copy promptly, never block or retain the pointer.
+    void (*wakeAudioObserver)(const int16_t* pcm, size_t samples,
+                              bool processed) = nullptr;
     const char* wakeModelPartition = "model";
     // Optional substring used to select one WakeNet model from the partition.
     // Leave null to keep the ESP-SR default (the first WakeNet model).
     const char* wakeModelKeyword = nullptr;
     const char* defaultWakeWord = "你好小智";
     WakeDetectionMode wakeDetectionMode = WakeDetectionMode::Aggressive;
+    // 0 keeps the model's mode-specific threshold; otherwise 0.4..0.9999.
+    // A lower value accepts weaker matches sooner, but can cause false wakes.
+    float wakeDetectionThreshold = 0.0f;
     uint32_t wakeTaskStackBytes = 8 * 1024;
     uint8_t wakeTaskPriority = 5;
     int wakeTaskCore = 0;
@@ -396,6 +420,28 @@ class I2sOpusAudioPort final : public xiaozhi::EncodedAudioPort {
   // Legacy polling fallback for direct Client users without ClientRuntime.
   void setWakeDetectionEnabled(bool enabled);
   bool consumeWakeWord(std::string& wakeWord);
+
+  struct WakeStats {
+    bool enabled = false;
+    bool capturing = false;
+    bool aecActive = false;
+    uint32_t reads = 0;
+    uint32_t partialReads = 0;
+    uint32_t clippedReads = 0;
+    float microphoneGainDb = -1.0f;
+    uint32_t frames = 0;
+    uint32_t detections = 0;
+    uint32_t lastDetectionMs = 0;
+    uint32_t peak = 0;
+    uint32_t rms = 0;
+    uint32_t captureRms = 0;
+    uint32_t referenceRms = 0;
+    uint32_t cleanRms = 0;
+    uint32_t aecFrames = 0;
+    uint32_t maximumAecUs = 0;
+    char channel = 'L';
+  };
+  WakeStats wakeStats() const;
 
  private:
   struct Impl;

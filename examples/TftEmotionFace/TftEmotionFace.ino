@@ -1,9 +1,9 @@
 /*
  * TftEmotionFace example
  *
- * Complete Xiaozhi voice terminal with TftRobotEyes expressions. It receives
+ * Complete Xiaozhi voice terminal with grokEyes expressions. It receives
  * Xiaozhi LLM emotion events, prints their typed state to Serial, and forwards
- * the exact protocol string to TftRobotEyes. A compile-time selected audio
+ * the exact protocol string to grokEyes. A compile-time selected audio
  * preset handles microphone capture, Opus playback, and WakeNet. This sketch
  * owns its TFT and BOOT-button configuration.
  *
@@ -22,6 +22,7 @@
 
 // Change this one line to NULLLAB_AI_VOX for first-generation AI VOX audio.
 // For the ES8311-based AI-VOX3, use NULLLAB_AI_VOX3.
+// OJoy: select OJ_ESP32S3_OJOY and use build_ojoy.ps1 for CH13613 QSPI.
 #ifndef XIAOZHI_BOARD
 #define XIAOZHI_BOARD OJ_ESP32S3_BASIC
 #endif
@@ -44,13 +45,38 @@
 #include <grokEyes.h>
 #include <WiFi.h>
 
+#if XIAOZHI_BOARD == OJ_ESP32S3_OJOY
+#if !defined(CH13613_DRIVER) || defined(ST7789_DRIVER) || \
+    TFT_WIDTH != 480 || TFT_HEIGHT != 480
+#error "OJoy requires the CH13613 480x480 setup; use build_ojoy.ps1"
+#endif
+#endif
+
 #include <cstring>
 
+#ifndef XIAOZHI_WAKE_DIAGNOSTICS
+#define XIAOZHI_WAKE_DIAGNOSTICS 0
+#endif
+#ifndef XIAOZHI_SHOW_DEBUG_STATUS
+#define XIAOZHI_SHOW_DEBUG_STATUS 1
+#endif
+#if XIAOZHI_WAKE_DIAGNOSTICS
+#include "WakeDiagnostics.h"
+#endif
+
 #ifndef XIAOZHI_DEVICE_BOARD_TYPE
+#if XIAOZHI_BOARD == OJ_ESP32S3_OJOY
+#define XIAOZHI_DEVICE_BOARD_TYPE "oj-esp32s3-ojoy"
+#else
 #define XIAOZHI_DEVICE_BOARD_TYPE "esp32s3-tft-emotion-face"
 #endif
+#endif
 #ifndef XIAOZHI_DEVICE_BOARD_NAME
+#if XIAOZHI_BOARD == OJ_ESP32S3_OJOY
+#define XIAOZHI_DEVICE_BOARD_NAME "OpenJumper OJoy"
+#else
 #define XIAOZHI_DEVICE_BOARD_NAME "ESP32-S3 TFT Emotion Face"
+#endif
 #endif
 #ifndef XIAOZHI_CHAT_BUTTON_PIN
 #define XIAOZHI_CHAT_BUTTON_PIN 0
@@ -66,7 +92,14 @@
 #define XIAOZHI_ENABLE_SERVER_AEC_DEFAULT 1
 #endif
 #ifndef XIAOZHI_ENABLE_VOICE_BARGE_IN_DEFAULT
-#define XIAOZHI_ENABLE_VOICE_BARGE_IN_DEFAULT 1
+#define XIAOZHI_ENABLE_VOICE_BARGE_IN_DEFAULT 0
+#endif
+#ifndef XIAOZHI_ENABLE_WAKE_WORD_INTERRUPTION_DEFAULT
+#define XIAOZHI_ENABLE_WAKE_WORD_INTERRUPTION_DEFAULT 1
+#endif
+#if XIAOZHI_ENABLE_WAKE_WORD_INTERRUPTION_DEFAULT && \
+    XIAOZHI_ENABLE_VOICE_BARGE_IN_DEFAULT
+#error "Select local wake-word interruption or server Realtime voice barge-in"
 #endif
 #if XIAOZHI_ENABLE_VOICE_BARGE_IN_DEFAULT && \
     !XIAOZHI_ENABLE_SERVER_AEC_DEFAULT
@@ -100,6 +133,13 @@ SET_LOOP_TASK_STACK_SIZE(16 * 1024);
 
 TFT_eSPI tft;
 grokEyes eyes(tft, grokEyes::PLAIN_BASIC);
+#if XIAOZHI_SHOW_DEBUG_STATUS
+TFT_eSprite debugStatusSprite(&tft);
+bool debugStatusReady = false;
+const char* debugStartupPhase = "STARTING";
+char debugLastError[48] = {};
+uint32_t debugErrorAtMs = 0;
+#endif
 xiaozhi::ArduinoWebSocketTransport network_transport;
 
 xiaozhi::AsyncTransportConfig makeTransportConfig() {
@@ -108,10 +148,13 @@ xiaozhi::AsyncTransportConfig makeTransportConfig() {
   config.receive_text_pool_depth = 1;
   config.receive_binary_pool_depth = 1;
   config.transmit_control_pool_depth = 3;
-  config.transmit_audio_pool_depth = 2;
+  config.transmit_audio_pool_depth = 4;
   config.maximum_text_bytes = 4096;
   config.maximum_binary_bytes = 1275 + 16;
   config.task_stack_in_psram = true;
+  // The official service closes its audio channel after goodbye/inactivity.
+  // Return to local wake listening instead of reopening that finished chat.
+  config.reconnect_after_disconnect = false;
   return config;
 }
 
@@ -131,11 +174,35 @@ I2sOpusAudioPort::Config makeAudioConfig() {
   config.speechStartPackets = 2;
   config.speechHoldMs = 420;
   config.enableWakeDetection = true;
+  config.enableWakeWordInterruption =
+      XIAOZHI_ENABLE_WAKE_WORD_INTERRUPTION_DEFAULT != 0;
   config.wakeModelPartition = "model";
   config.wakeModelKeyword = "wn9_nihaoxiaozhi_tts";
   config.defaultWakeWord = "你好小智";
   config.wakeDetectionMode = I2sOpusAudioPort::WakeDetectionMode::Balanced;
-  config.captureChannel = I2sOpusAudioPort::CaptureChannel::Auto;
+#if XIAOZHI_WAKE_DIAGNOSTICS
+  config.wakeAudioObserver = wake_diagnostics::observe;
+#endif
+#if XIAOZHI_BOARD == OJ_ESP32S3_OJOY
+  // Leave speaker headroom for acoustic wake-word interruption.
+  config.hardware.es8311.outputVolumeDb = -12.0f;
+  // Reduce playback echo at the ADC while keeping nearby speech audible.
+  // Restore the normal 24 dB input gain when the speaker is muted.
+  config.hardware.es8311.playbackMicrophoneGainDb = 12.0f;
+  config.playbackMuteDelayMs = 150;
+  config.enableWakeAec = true;
+  config.wakeAecDuringPlaybackOnly = true;
+  config.wakeDetectionMode = I2sOpusAudioPort::WakeDetectionMode::Aggressive;
+  // Model metadata uses ~0.63. Favor the first utterance without requiring
+  // a repeated word to build a stronger match; retain echo cancellation.
+  config.wakeDetectionThreshold = 0.55f;
+  config.wakeTaskStackBytes = 8 * 1024;
+  // The right slot is playback reference, never an alternative microphone.
+  config.captureChannel = I2sOpusAudioPort::CaptureChannel::Left;
+  // The board's lower ADC gain needs a correspondingly lower uplink gate.
+  config.speechGateRms = 40;
+  config.speechMaximumGain = 16.0f;
+#endif
   return config;
 }
 
@@ -166,6 +233,11 @@ void tlsHeapCapsFree(void* allocation) {
 
 constexpr uint16_t kExpressionTransitionMs = 600;
 constexpr uint32_t kChatButtonDebounceMs = 40;
+#if defined(CH13613_DRIVER)
+constexpr int16_t kStatusVerticalInset = 70;  // Keep text inside the round panel.
+#else
+constexpr int16_t kStatusVerticalInset = 0;
+#endif
 
 std::string pendingEmotionName = "neutral";
 std::string currentEmotionName = "neutral";
@@ -184,6 +256,8 @@ uint32_t lastActivationCountdownSec = 0xFFFFFFFFUL;
 uint32_t lastHeartbeatMs = 0;
 uint32_t downlinkAudioFrames = 0;
 uint32_t downlinkAudioBytes = 0;
+uint32_t measuredWakeAudioHits = 0;
+uint32_t measuredWakeCaptureHits = 0;
 bool chatButtonReading = HIGH;
 bool chatButtonStableState = HIGH;
 uint32_t chatButtonChangedMs = 0;
@@ -242,20 +316,24 @@ void queueLocalEmotion(const char* name) {
 void showSystemScreen(const char* title, const char* line1,
                       const char* line2 = nullptr) {
   fatalScreen = true;
-  tft.fillScreen(TFT_BLACK);
-  tft.setTextWrap(false, false);
-  tft.setTextDatum(TC_DATUM);
-  tft.setTextColor(TFT_RED, TFT_BLACK);
-  tft.setTextSize(2);
-  tft.drawString(title, tft.width() / 2, 24, 1);
-  tft.setTextColor(TFT_WHITE, TFT_BLACK);
-  tft.setTextSize(1);
-  tft.drawString(line1, tft.width() / 2, 76, 1);
+  // Reuse the eyes framebuffer while animation is suspended. Full-frame pushes
+  // satisfy CH13613's 2x2 window alignment even for one-pixel text strokes.
+  auto& screen = eyes.sprite();
+  screen.fillSprite(TFT_BLACK);
+  screen.setTextWrap(false, false);
+  screen.setTextDatum(TC_DATUM);
+  screen.setTextColor(TFT_RED, TFT_BLACK);
+  screen.setTextSize(2);
+  screen.drawString(title, tft.width() / 2, kStatusVerticalInset + 24, 1);
+  screen.setTextColor(TFT_WHITE, TFT_BLACK);
+  screen.setTextSize(1);
+  screen.drawString(line1, tft.width() / 2, kStatusVerticalInset + 76, 1);
   if (line2 != nullptr) {
-    tft.setTextColor(TFT_YELLOW, TFT_BLACK);
-    tft.drawString(line2, tft.width() / 2, 98, 1);
+    screen.setTextColor(TFT_YELLOW, TFT_BLACK);
+    screen.drawString(line2, tft.width() / 2, kStatusVerticalInset + 98, 1);
   }
-  tft.setTextDatum(TL_DATUM);
+  screen.setTextDatum(TL_DATUM);
+  screen.pushSprite(0, 0);
 }
 
 void drawActivationCountdown(uint32_t seconds) {
@@ -267,42 +345,51 @@ void drawActivationCountdown(uint32_t seconds) {
   char text[48];
   snprintf(text, sizeof(text), "Checking registration in %lu s",
            static_cast<unsigned long>(seconds));
-  const int16_t footerY = tft.height() - 20;
-  tft.fillRect(0, footerY, tft.width(), 20, TFT_BLACK);
-  tft.setTextDatum(TC_DATUM);
-  tft.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
-  tft.setTextSize(1);
-  tft.drawString(text, tft.width() / 2, footerY + 5, 1);
-  tft.setTextDatum(TL_DATUM);
+  const int16_t footerY = tft.height() - 20 - kStatusVerticalInset;
+  auto& screen = eyes.sprite();
+  screen.fillRect(0, footerY, tft.width(), 20, TFT_BLACK);
+  screen.setTextDatum(TC_DATUM);
+  screen.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
+  screen.setTextSize(1);
+  screen.drawString(text, tft.width() / 2, footerY + 5, 1);
+  screen.setTextDatum(TL_DATUM);
+  screen.pushSprite(0, 0);
 }
 
 void showActivationScreen(const std::string& code) {
   const int16_t centerX = tft.width() / 2;
   const bool compact = tft.height() < 200;
-  tft.fillScreen(TFT_BLACK);
-  tft.setTextDatum(TC_DATUM);
-  tft.setTextWrap(false, false);
+  auto& screen = eyes.sprite();
+  screen.fillSprite(TFT_BLACK);
+  screen.setTextDatum(TC_DATUM);
+  screen.setTextWrap(false, false);
 
-  tft.setTextColor(TFT_CYAN, TFT_BLACK);
-  tft.setTextSize(2);
-  tft.drawString("XIAOZHI SETUP", centerX, compact ? 4 : 10, 1);
+  screen.setTextColor(TFT_CYAN, TFT_BLACK);
+  screen.setTextSize(2);
+  screen.drawString("XIAOZHI SETUP", centerX,
+                    compact ? 4 : kStatusVerticalInset + 10, 1);
 
-  tft.setTextColor(TFT_YELLOW, TFT_BLACK);
-  tft.setTextSize(2);
-  tft.drawString("NOT REGISTERED", centerX, compact ? 26 : 42, 1);
+  screen.setTextColor(TFT_YELLOW, TFT_BLACK);
+  screen.setTextSize(2);
+  screen.drawString("NOT REGISTERED", centerX,
+                    compact ? 26 : kStatusVerticalInset + 42, 1);
 
-  tft.setTextColor(TFT_WHITE, TFT_BLACK);
-  tft.setTextSize(compact ? 2 : 3);
-  tft.drawString("xiaozhi.me", centerX, compact ? 50 : 78, 1);
+  screen.setTextColor(TFT_WHITE, TFT_BLACK);
+  screen.setTextSize(compact ? 2 : 3);
+  screen.drawString("xiaozhi.me", centerX,
+                    compact ? 50 : kStatusVerticalInset + 78, 1);
 
-  tft.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
-  tft.setTextSize(1);
-  tft.drawString("ENTER ACTIVATION CODE", centerX, compact ? 76 : 118, 1);
+  screen.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
+  screen.setTextSize(1);
+  screen.drawString("ENTER ACTIVATION CODE", centerX,
+                    compact ? 76 : kStatusVerticalInset + 118, 1);
 
-  tft.setTextColor(TFT_GREEN, TFT_BLACK);
-  tft.setTextSize(compact ? 3 : 4);
-  tft.drawString(code.c_str(), centerX, compact ? 90 : 140, 1);
-  tft.setTextDatum(TL_DATUM);
+  screen.setTextColor(TFT_GREEN, TFT_BLACK);
+  screen.setTextSize(compact ? 3 : 4);
+  screen.drawString(code.c_str(), centerX,
+                    compact ? 90 : kStatusVerticalInset + 140, 1);
+  screen.setTextDatum(TL_DATUM);
+  screen.pushSprite(0, 0);
 
   lastActivationCountdownSec = 0xFFFFFFFFUL;
 }
@@ -332,6 +419,77 @@ void updateDemo(uint32_t now) {
 xiaozhi::Client client(transport);
 xiaozhi::ClientRuntime runtime(client);
 
+void drawDebugStatus(bool force = false) {
+#if XIAOZHI_SHOW_DEBUG_STATUS
+  if (!debugStatusReady || activationRequired || fatalScreen) { return; }
+  static uint32_t lastUpdate = 0;
+  static uint32_t lastFrame = 0;
+  static uint32_t lastHits = 0;
+  const uint32_t now = millis();
+  const auto wake = audioPort.wakeStats();
+  if (wake.detections != lastHits) {
+    lastHits = wake.detections;
+    force = true;
+  }
+  if (force || now - lastUpdate >= 250) {
+    lastUpdate = now;
+    const bool online = WiFi.status() == WL_CONNECTED;
+    auto& panel = debugStatusSprite;
+    panel.fillSprite(TFT_BLACK);
+    panel.setTextDatum(TC_DATUM);
+    panel.setTextColor(online ? TFT_GREEN : TFT_ORANGE, TFT_BLACK);
+    char text[64];
+    snprintf(text, sizeof(text), "WiFi %s | %s", online ? "ONLINE" : "OFFLINE",
+             clientStarted ? runtime.stateName() : debugStartupPhase);
+    panel.drawString(text, panel.width() / 2, 2, 2);
+    panel.setTextColor(wake.enabled ? TFT_CYAN : TFT_LIGHTGREY, TFT_BLACK);
+    const bool justHeard = wake.detections != 0 && now - wake.lastDetectionMs < 6000;
+    snprintf(text, sizeof(text), "%s | HITS %lu | MIC %s",
+             justHeard ? "HEARD!" : (wake.enabled ? "WAKE ON" : "WAKE OFF"),
+             static_cast<unsigned long>(wake.detections),
+             wake.capturing ? "SEND" : "LOCAL");
+    if (!justHeard && wake.capturing) {
+      snprintf(text, sizeof(text), "LISTENING: SPEAK NOW | HITS %lu",
+               static_cast<unsigned long>(wake.detections));
+    }
+    panel.drawString(text, panel.width() / 2, 25, 2);
+    panel.setTextColor(TFT_WHITE, TFT_BLACK);
+    snprintf(text, sizeof(text), "MIC %lu  REF %lu  AFE %lu",
+             static_cast<unsigned long>(wake.capturing ? wake.captureRms : wake.rms),
+             static_cast<unsigned long>(wake.referenceRms),
+             static_cast<unsigned long>(wake.cleanRms));
+    if (wake.enabled && !wake.aecActive) {
+      snprintf(text, sizeof(text), "MIC %lu  AFE %lu  AEC OFF",
+               static_cast<unsigned long>(wake.rms), static_cast<unsigned long>(wake.cleanRms));
+    }
+#if XIAOZHI_WAKE_DIAGNOSTICS
+    if (wake_diagnostics::recording.load()) {
+      snprintf(text, sizeof(text), "RECORDING %lu s",
+               static_cast<unsigned long>((now - wake_diagnostics::startedMs) / 1000));
+    }
+    if (wake_diagnostics::dumping) {
+      snprintf(text, sizeof(text), "EXPORTING AUDIO %u/2", wake_diagnostics::dumpStage + 1);
+    }
+#endif
+    if (debugLastError[0] != '\0' && now - debugErrorAtMs < 10000) {
+      panel.setTextColor(TFT_RED, TFT_BLACK);
+      snprintf(text, sizeof(text), "ERROR: %.32s", debugLastError);
+    }
+    panel.drawString(text, panel.width() / 2, 48, 2);
+    force = true;
+  }
+  // Redraw this separate, even-sized band after eye frames. It stays inside
+  // the round AMOLED and is never cleared by grokEyes' full-sprite refresh.
+  if (force || lastFrame != eyes.renderedFrames()) {
+    lastFrame = eyes.renderedFrames();
+    const int16_t y = (tft.height() - kStatusVerticalInset - 72) & ~1;
+    debugStatusSprite.pushSprite(0, y);
+  }
+#else
+  (void)force;
+#endif
+}
+
 void toggleDialogue(const char* source) {
   if (!runtime.ready()) {
     Serial.printf("[xiaozhi] %s ignored: client is not ready\n", source);
@@ -354,8 +512,19 @@ void toggleDialogue(const char* source) {
 void pollDialogueTriggers() {
   while (Serial.available() > 0) {
     const char command = static_cast<char>(Serial.read());
+#if XIAOZHI_WAKE_DIAGNOSTICS
+    if (wake_diagnostics::command(command)) { continue; }
+#endif
     if (command == 't' || command == 'T') {
       toggleDialogue("serial");
+    } else if (command == 'w' || command == 'W') {
+      // Exercise the same urgent control path as WakeNet without requiring
+      // an acoustic trigger. Real detection still happens on the wake task.
+      const char* word = audioConfig.defaultWakeWord;
+      const xiaozhi::State previousState = runtime.state();
+      const bool accepted = runtime.requestWakeWordDetected(word, std::strlen(word));
+      Serial.printf("[wake] serial trigger from state=%s accepted=%s\n",
+                    xiaozhi::stateName(previousState), accepted ? "yes" : "no");
     }
   }
 
@@ -376,16 +545,37 @@ void pollDialogueTriggers() {
 
 void setup() {
   Serial.begin(115200);
+#if ARDUINO_USB_CDC_ON_BOOT && ARDUINO_USB_MODE
+  Serial.setTxBufferSize(1024);
+  Serial.setTxTimeoutMs(0);
+#endif
   delay(250);
+#if XIAOZHI_BOARD == OJ_ESP32S3_OJOY
+  // Audio packet/PCM pools otherwise consume internal RAM in many 1-3 KiB
+  // allocations. Keep task stacks, Wi-Fi/AES and DMA allocations internal;
+  // let ordinary buffers >= 1 KiB prefer the board's 8 MiB PSRAM.
+  if (psramFound()) {
+    heap_caps_malloc_extmem_enable(1024);
+  }
+#endif
   pinMode(XIAOZHI_CHAT_BUTTON_PIN, INPUT_PULLUP);
   Serial.printf("[audio] profile=%s\n",
                 I2sOpusAudioPort::Config::compiledProfileName());
+  Serial.printf("[board] %s psram=%lu free_psram=%lu\n",
+                XIAOZHI_DEVICE_BOARD_NAME,
+                static_cast<unsigned long>(ESP.getPsramSize()),
+                static_cast<unsigned long>(ESP.getFreePsram()));
 
+#if defined(TFT_TE) && TFT_TE >= 0
+  pinMode(TFT_TE, INPUT);
+#endif
   tft.init();
   tft.setRotation(XIAOZHI_TFT_ROTATION);
   tft.fillScreen(TFT_BLACK);
 
   eyesReady = eyes.begin(50);
+  Serial.printf("[display] grokEyes=%s size=%dx%d\n",
+                eyesReady ? "ready" : "failed", tft.width(), tft.height());
   if (!eyesReady) {
     tft.fillScreen(TFT_RED);
     Serial.println("[display] grokEyes sprite allocation failed");
@@ -394,6 +584,14 @@ void setup() {
   eyes.setAutoBlink(true, 3000, 1600);
   eyes.setIdle(true, 1700);
   eyes.setExpression("neutral", 0);
+#if XIAOZHI_SHOW_DEBUG_STATUS
+  if (tft.height() >= 240) {
+    debugStatusReady = debugStatusSprite.createSprite(tft.width() & ~1, 72) != nullptr;
+    if (debugStatusReady) { eyes.setPosition(120, 104, 0); }
+    Serial.printf("[display] debug status=%s\n", debugStatusReady ? "ready" : "unavailable");
+    drawDebugStatus(true);
+  }
+#endif
 
   const auto& audioOutput = audioConfig.hardware.output;
   Serial.printf("[audio] profile=%s OUT port=%d MCLK=%d BCLK=%d WS=%d DATA=%d\n",
@@ -410,8 +608,9 @@ void setup() {
 #endif
   } else {
 #if XIAOZHI_AUDIO_ENABLE_CODEC_ES8311
-    Serial.printf("[audio] ES8311 detected at I2C address 0x%02X\n",
-                  audioConfig.hardware.es8311.address);
+    Serial.printf("[audio] ES8311 detected at I2C address 0x%02X; output=%.1f dB\n",
+                  audioConfig.hardware.es8311.address,
+                  audioConfig.hardware.es8311.outputVolumeDb);
 #else
     Serial.println("[audio] direct audio pins configured; runtime probe unavailable");
 #endif
@@ -426,7 +625,16 @@ void setup() {
 
   WiFi.mode(WIFI_STA);
   WiFi.begin(kWifiSsid, kWifiPassword);
+  // This interactive example favors response time over modem power saving.
+  WiFi.setSleep(false);
+#if XIAOZHI_SHOW_DEBUG_STATUS
+  debugStartupPhase = "WIFI CONNECTING";
+  drawDebugStatus(true);
+#endif
   if (WiFi.waitForConnectResult() != WL_CONNECTED) {
+#if XIAOZHI_SHOW_DEBUG_STATUS
+    debugStartupPhase = "WIFI FAILED";
+#endif
     queueLocalEmotion("shocked");
     Serial.println("[wifi] connection failed");
     return;
@@ -439,11 +647,18 @@ void setup() {
   serviceOptions.board_type = XIAOZHI_DEVICE_BOARD_TYPE;
   serviceOptions.board_name = XIAOZHI_DEVICE_BOARD_NAME;
   Serial.println("[network] fetching official Xiaozhi configuration");
+#if XIAOZHI_SHOW_DEBUG_STATUS
+  debugStartupPhase = "CHECKING ACCOUNT";
+  drawDebugStatus(true);
+#endif
   if (!xiaozhi::ArduinoOfficialService::configure(
           config, provisioning, provisioningError, serviceOptions)) {
     queueLocalEmotion("shocked");
     Serial.printf("[xiaozhi] provisioning failed: %s\n",
                   provisioningError.c_str());
+#if XIAOZHI_SHOW_DEBUG_STATUS
+    debugStartupPhase = "CONFIG FAILED";
+#endif
     return;
   }
 #if XIAOZHI_PROTOCOL_VERSION_OVERRIDE != 0
@@ -470,6 +685,8 @@ void setup() {
   Serial.printf("[audio] server AEC=%s voice barge-in=%s\n",
                 config.enable_server_aec ? "on" : "off",
                 config.enable_voice_barge_in ? "on" : "off");
+  Serial.printf("[wake] word interruption=%s\n",
+                audioConfig.enableWakeWordInterruption ? "on" : "off");
   if (aecRequested && !config.enable_server_aec) {
     Serial.println("[audio] protocol has no AEC timestamp; using AutoStop to prevent echo self-interruption");
   }
@@ -488,8 +705,12 @@ void setup() {
   }
   if (!audioHardwareReady) {
 #if XIAOZHI_AUDIO_ENABLE_CODEC_ES8311
+    char pins[40];
+    snprintf(pins, sizeof(pins), "CHECK SDA%d SCL%d",
+             audioConfig.hardware.es8311.i2cSda,
+             audioConfig.hardware.es8311.i2cScl);
     showSystemScreen("AUDIO ERROR", "ES8311 NOT FOUND",
-                     "CHECK SDA41 SCL42");
+                     pins);
 #else
     showSystemScreen("AUDIO ERROR", "AUDIO NOT READY",
                      "CHECK AUDIO PINS");
@@ -502,7 +723,12 @@ void setup() {
   xiaozhi::Callbacks callbacks;
   callbacks.on_event = onEvent;
   callbacks.on_wake_word = [](const std::string& wakeWord) {
-    Serial.printf("[wake] detected: %s\n", wakeWord.c_str());
+    const auto wake = audioPort.wakeStats();
+    queueLocalEmotion("thinking");
+    Serial.printf("[wake] detected: %s at=%lu dispatch_ms=%lu hits=%lu\n",
+                  wakeWord.c_str(), static_cast<unsigned long>(wake.lastDetectionMs),
+                  static_cast<unsigned long>(millis() - wake.lastDetectionMs),
+                  static_cast<unsigned long>(wake.detections));
   };
   callbacks.on_state_changed = [](xiaozhi::State, xiaozhi::State next) {
     Serial.printf("[xiaozhi] state=%s\n", xiaozhi::stateName(next));
@@ -513,16 +739,32 @@ void setup() {
     }
   };
   callbacks.on_capture = [](bool enabled, const xiaozhi::AudioFormat& format) {
+    const auto wake = audioPort.wakeStats();
+    if (enabled && wake.detections != measuredWakeCaptureHits) {
+      measuredWakeCaptureHits = wake.detections;
+      Serial.printf("[wake-latency] capture_ms=%lu\n",
+                    static_cast<unsigned long>(millis() - wake.lastDetectionMs));
+    }
     Serial.printf("[xiaozhi] capture=%s format=%lu Hz/%u ch/%u ms\n",
                   enabled ? "on" : "off",
                   static_cast<unsigned long>(format.sample_rate),
                   format.channels, format.frame_duration_ms);
   };
   callbacks.on_audio_meta = [](const xiaozhi::AudioFrameMeta& meta) {
+    const auto wake = audioPort.wakeStats();
+    if (wake.detections != measuredWakeAudioHits) {
+      measuredWakeAudioHits = wake.detections;
+      Serial.printf("[wake-latency] first_downlink_ms=%lu\n",
+                    static_cast<unsigned long>(millis() - wake.lastDetectionMs));
+    }
     ++downlinkAudioFrames;
     downlinkAudioBytes += static_cast<uint32_t>(meta.opus_bytes);
   };
   callbacks.on_error = [](xiaozhi::ErrorCode code, const std::string& message) {
+#if XIAOZHI_SHOW_DEBUG_STATUS
+    snprintf(debugLastError, sizeof(debugLastError), "%s", xiaozhi::errorName(code));
+    debugErrorAtMs = millis();
+#endif
     // The official service may close an otherwise completed session after
     // returning to idle. Keep that normal close from replacing the last
     // server-provided expression with an error face.
@@ -539,14 +781,6 @@ void setup() {
     return;
   }
   xiaozhi::ClientRuntimeConfig runtimeConfig;
-  runtimeConfig.lifecycle.on_state_changed =
-      [](void*, xiaozhi::State, xiaozhi::State next, bool sessionReady) {
-        const bool lowLatencySession = sessionReady ||
-                                       next == xiaozhi::State::Connecting ||
-                                       next == xiaozhi::State::Listening ||
-                                       next == xiaozhi::State::Speaking;
-        WiFi.setSleep(!lowLatencySession);
-      };
   if (!runtime.begin(config, callbacks, runtimeConfig)) {
     showSystemScreen("STARTUP ERROR", "AUDIO OR CLIENT FAILED",
                      "CHECK SERIAL LOG");
@@ -554,7 +788,8 @@ void setup() {
   }
   clientStarted = true;
   Serial.println(
-      "[xiaozhi] ready; say 你好小智, press BOOT, or send 't'");
+      "[xiaozhi] ready; say 你好小智 (also interrupts speech), press BOOT, "
+      "or send 't'; 'w' tests the wake control path");
 }
 
 void loop() {
@@ -580,6 +815,14 @@ void loop() {
   if (clientStarted) {
     runtime.loop();
     pollDialogueTriggers();
+#if XIAOZHI_WAKE_DIAGNOSTICS
+    wake_diagnostics::loop();
+    if (wake_diagnostics::dumping) {
+      drawDebugStatus();
+      delay(1);
+      return;
+    }
+#endif
   }
   updateDemo(millis());
 
@@ -592,13 +835,14 @@ void loop() {
   if (eyesReady) {
     eyes.update();
   }
+  drawDebugStatus();
 
   const uint32_t now = millis();
   if (now - lastHeartbeatMs >= 5000) {
     lastHeartbeatMs = now;
     Serial.printf(
         "[heartbeat] eyes=%s wifi=%d client=%s emotion=%u,%s "
-        "display=%u,%s audio=%lu/%lu heap=%lu\n",
+        "display=%u,%s audio=%lu/%lu heap=%lu frames=%lu free_psram=%lu\n",
         eyesReady ? "ready" : "failed", static_cast<int>(WiFi.status()),
         runtime.stateName(), static_cast<unsigned>(currentEmotion),
         xiaozhi::emotionName(currentEmotion),
@@ -606,7 +850,24 @@ void loop() {
         currentEmotionName.c_str(),
         static_cast<unsigned long>(downlinkAudioFrames),
         static_cast<unsigned long>(downlinkAudioBytes),
-        static_cast<unsigned long>(ESP.getFreeHeap()));
+        static_cast<unsigned long>(ESP.getFreeHeap()),
+        static_cast<unsigned long>(eyes.renderedFrames()),
+        static_cast<unsigned long>(ESP.getFreePsram()));
+    const auto wake = audioPort.wakeStats();
+    Serial.printf("[wake-status] on=%u capture=%u reads=%lu partial=%lu frames=%lu "
+                  "hits=%lu peak=%lu rms=%lu ch=%c ref=%lu clean=%lu aec=%lu aec_us=%lu aec_on=%u clip=%lu mic_db=%.0f\n",
+                  wake.enabled, wake.capturing,
+                  static_cast<unsigned long>(wake.reads),
+                  static_cast<unsigned long>(wake.partialReads),
+                  static_cast<unsigned long>(wake.frames),
+                  static_cast<unsigned long>(wake.detections),
+                  static_cast<unsigned long>(wake.peak),
+                  static_cast<unsigned long>(wake.rms), wake.channel,
+                  static_cast<unsigned long>(wake.referenceRms),
+                  static_cast<unsigned long>(wake.cleanRms),
+                  static_cast<unsigned long>(wake.aecFrames),
+                  static_cast<unsigned long>(wake.maximumAecUs), wake.aecActive,
+                  static_cast<unsigned long>(wake.clippedReads), wake.microphoneGainDb);
   }
 
   delay(1);
